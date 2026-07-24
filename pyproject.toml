@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "open1c-analyzer"
+version = "0.1.0"
+description = "Static analysis and knowledge extraction toolkit for 1C:Enterprise source exports"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Konstantin Nurislamov" }]
+dependencies = [
+  "alembic>=1.13,<2.0",
+  "pydantic-settings>=2.6,<3.0",
+  "rich>=13.9,<15.0",
+  "sqlalchemy>=2.0,<3.0",
+  "typer>=0.15,<1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.13,<2.0",
+  "pytest>=8.3,<9.0",
+  "pytest-cov>=6.0,<7.0",
+  "ruff>=0.9,<1.0",
+]
+
+[project.scripts]
+open1c = "open1c_analyzer.cli.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/open1c_analyzer"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --cov=open1c_analyzer --cov-report=term-missing"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["open1c_analyzer"]
+mypy_path = "src"
+
+[tool.coverage.run]
+branch = true
+source = ["open1c_analyzer"]
+omit = ["*/migrations/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
