@@ -1,27 +1,15 @@
 """Open1C Analyzer command-line interface."""
 
-from pathlib import Path
-
 import typer
-from alembic import command
-from alembic.config import Config
-from rich.console import Console
 from sqlalchemy import text
 
+from open1c_analyzer.cli.common import console, database_session, migrate_database
+from open1c_analyzer.cli.project import project_app
 from open1c_analyzer.config import Settings
-from open1c_analyzer.storage.database import Database
 from open1c_analyzer.version import __version__
 
 app = typer.Typer(no_args_is_help=True, help="Analyze exported 1C:Enterprise source code.")
-console = Console()
-
-
-def _alembic_config(settings: Settings) -> Config:
-    migrations_path = Path(__file__).resolve().parents[1] / "migrations"
-    config = Config()
-    config.set_main_option("script_location", str(migrations_path))
-    config.set_main_option("sqlalchemy.url", settings.database_url)
-    return config
+app.add_typer(project_app, name="project")
 
 
 @app.command()
@@ -34,8 +22,7 @@ def version() -> None:
 def migrate() -> None:
     """Apply all database migrations."""
     settings = Settings()
-    settings.database_path.parent.mkdir(parents=True, exist_ok=True)
-    command.upgrade(_alembic_config(settings), "head")
+    migrate_database(settings)
     console.print(f"Database migrated: {settings.database_path}")
 
 
@@ -61,13 +48,9 @@ def doctor() -> None:
     )
 
     try:
-        database = Database(settings.database_url)
-        try:
-            with database.session() as session:
-                session.execute(text("SELECT 1"))
-            checks.append(("SQLite connection", True, settings.database_url))
-        finally:
-            database.dispose()
+        with database_session() as session:
+            session.execute(text("SELECT 1"))
+        checks.append(("SQLite connection", True, settings.database_url))
     except Exception as exc:  # pragma: no cover - defensive CLI reporting
         checks.append(("SQLite connection", False, str(exc)))
 

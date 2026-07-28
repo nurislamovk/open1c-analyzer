@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "open1c-analyzer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Static analysis and knowledge extraction toolkit for 1C:Enterprise source exports"
 readme = "README.md"
 requires-python = ">=3.12"
