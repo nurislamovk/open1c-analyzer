@@ -1,0 +1,168 @@
+"""Normalization and metadata-name helpers."""
+
+import re
+
+DIRECTORY_KIND_MAP = {
+    "AccountingRegisters": "accounting_register",
+    "AccumulationRegisters": "accumulation_register",
+    "BusinessProcesses": "business_process",
+    "CalculationRegisters": "calculation_register",
+    "Catalogs": "catalog",
+    "ChartsOfAccounts": "chart_of_accounts",
+    "ChartsOfCalculationTypes": "chart_of_calculation_types",
+    "ChartsOfCharacteristicTypes": "chart_of_characteristic_types",
+    "CommonAttributes": "common_attribute",
+    "CommonModules": "common_module",
+    "Constants": "constant",
+    "DataProcessors": "data_processor",
+    "DefinedTypes": "defined_type",
+    "DocumentJournals": "document_journal",
+    "Documents": "document",
+    "Enums": "enumeration",
+    "Enumerations": "enumeration",
+    "ExchangePlans": "exchange_plan",
+    "InformationRegisters": "information_register",
+    "Reports": "report",
+    "Roles": "role",
+    "Sequences": "sequence",
+    "Subsystems": "subsystem",
+    "Tasks": "task",
+}
+
+XML_KIND_MAP = {
+    "AccountingRegister": "accounting_register",
+    "AccumulationRegister": "accumulation_register",
+    "BusinessProcess": "business_process",
+    "CalculationRegister": "calculation_register",
+    "Catalog": "catalog",
+    "ChartOfAccounts": "chart_of_accounts",
+    "ChartOfCalculationTypes": "chart_of_calculation_types",
+    "ChartOfCharacteristicTypes": "chart_of_characteristic_types",
+    "CommonAttribute": "common_attribute",
+    "CommonModule": "common_module",
+    "Configuration": "configuration",
+    "Constant": "constant",
+    "DataProcessor": "data_processor",
+    "DefinedType": "defined_type",
+    "Document": "document",
+    "DocumentJournal": "document_journal",
+    "Enum": "enumeration",
+    "Enumeration": "enumeration",
+    "ExchangePlan": "exchange_plan",
+    "InformationRegister": "information_register",
+    "Report": "report",
+    "Role": "role",
+    "Sequence": "sequence",
+    "Subsystem": "subsystem",
+    "Task": "task",
+}
+
+CHILD_KIND_MAP = {
+    "Attribute": "attribute",
+    "Command": "command",
+    "Dimension": "dimension",
+    "Form": "form",
+    "Resource": "resource",
+    "TabularSection": "tabular_section",
+    "Template": "template",
+}
+
+KIND_PREFIX = {
+    "accounting_register": "РегистрБухгалтерии",
+    "accumulation_register": "РегистрНакопления",
+    "business_process": "БизнесПроцесс",
+    "calculation_register": "РегистрРасчета",
+    "catalog": "Справочник",
+    "chart_of_accounts": "ПланСчетов",
+    "chart_of_calculation_types": "ПланВидовРасчета",
+    "chart_of_characteristic_types": "ПланВидовХарактеристик",
+    "common_attribute": "ОбщийРеквизит",
+    "common_module": "ОбщийМодуль",
+    "constant": "Константа",
+    "data_processor": "Обработка",
+    "defined_type": "ОпределяемыйТип",
+    "document": "Документ",
+    "document_journal": "ЖурналДокументов",
+    "enumeration": "Перечисление",
+    "exchange_plan": "ПланОбмена",
+    "information_register": "РегистрСведений",
+    "report": "Отчет",
+    "role": "Роль",
+    "sequence": "Последовательность",
+    "subsystem": "Подсистема",
+    "task": "Задача",
+}
+
+MANAGER_KIND = {
+    "документы": "document",
+    "documents": "document",
+    "обработки": "data_processor",
+    "dataprocessors": "data_processor",
+    "отчеты": "report",
+    "reports": "report",
+    "перечисления": "enumeration",
+    "enumerations": "enumeration",
+    "enums": "enumeration",
+    "планыобмена": "exchange_plan",
+    "exchangeplans": "exchange_plan",
+    "планысчетов": "chart_of_accounts",
+    "chartsofaccounts": "chart_of_accounts",
+    "регистрыбухгалтерии": "accounting_register",
+    "accountingregisters": "accounting_register",
+    "регистрынакопления": "accumulation_register",
+    "accumulationregisters": "accumulation_register",
+    "регистрырасчета": "calculation_register",
+    "calculationregisters": "calculation_register",
+    "регистрысведений": "information_register",
+    "informationregisters": "information_register",
+    "справочники": "catalog",
+    "catalogs": "catalog",
+    "бизнеспроцессы": "business_process",
+    "businessprocesses": "business_process",
+    "задачи": "task",
+    "tasks": "task",
+    "константы": "constant",
+    "constants": "constant",
+}
+
+TYPE_KIND = {
+    "AccountingRegisterRecordKey": "accounting_register",
+    "AccumulationRegisterRecordKey": "accumulation_register",
+    "BusinessProcessRef": "business_process",
+    "CalculationRegisterRecordKey": "calculation_register",
+    "CatalogRef": "catalog",
+    "ChartOfAccountsRef": "chart_of_accounts",
+    "ChartOfCalculationTypesRef": "chart_of_calculation_types",
+    "ChartOfCharacteristicTypesRef": "chart_of_characteristic_types",
+    "DocumentRef": "document",
+    "EnumRef": "enumeration",
+    "ExchangePlanRef": "exchange_plan",
+    "InformationRegisterRecordKey": "information_register",
+    "TaskRef": "task",
+    "БизнесПроцессСсылка": "business_process",
+    "ДокументСсылка": "document",
+    "ПланВидовРасчетаСсылка": "chart_of_calculation_types",
+    "ПланВидовХарактеристикСсылка": "chart_of_characteristic_types",
+    "ПланОбменаСсылка": "exchange_plan",
+    "ПланСчетовСсылка": "chart_of_accounts",
+    "ПеречислениеСсылка": "enumeration",
+    "СправочникСсылка": "catalog",
+    "ЗадачаСсылка": "task",
+}
+
+_CLEAN = re.compile(r"[^0-9a-zа-яё_]+", re.IGNORECASE)
+
+
+def normalize(value: str) -> str:
+    """Normalize identifiers and dotted metadata names for matching."""
+    return _CLEAN.sub("", value.casefold())
+
+
+def full_metadata_name(kind: str, name: str) -> str:
+    """Return a canonical 1C metadata name."""
+    return f"{KIND_PREFIX.get(kind, kind)}.{name}"
+
+
+def local_name(tag: str) -> str:
+    """Strip XML namespace syntax."""
+    return tag.rsplit("}", 1)[-1].split(":")[-1]

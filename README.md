@@ -1,68 +1,92 @@
 # Open1C Analyzer
 
-Open1C Analyzer is a Python toolkit for indexing, analyzing, and preparing exported
-1C:Enterprise source code for static analysis and LLM-assisted workflows.
+Open1C Analyzer builds a structured, queryable knowledge graph from an exported
+1C:Enterprise configuration. The graph is intended for impact analysis and for
+providing verified project context to an LLM before it proposes 1C code changes.
 
 ## Requirements
 
 - Python 3.12+
-- [uv](https://docs.astral.sh/uv/) (recommended)
+- `uv`
 
-## Development setup
+## Setup
 
-```bash
+```powershell
 uv sync --extra dev
 uv run open1c init
-uv run pytest
 ```
 
-By default, application data is stored in `.open1c/open1c.db` in the current directory.
-Override it with `OPEN1C_DATABASE_PATH`.
+By default, local data is stored in `.open1c/open1c.db`. Override the path with
+`OPEN1C_DATABASE_PATH`. Source files are read-only: the analyzer does not modify
+the exported configuration.
 
-## CLI
+## Analyzer Core workflow
 
-```bash
-open1c version
-open1c init
-open1c migrate
-open1c doctor
+Register an exported configuration and build the complete static index:
+
+```powershell
+uv run open1c project add TMS C:\Sources\TMS
+uv run open1c project analyze TMS
+uv run open1c project summary TMS
 ```
 
-### Project catalog
+A repeated `analyze` is incremental: unchanged files are skipped. Use `--force`
+for a complete rebuild.
 
-Register an exported 1C configuration directory and build its file catalog:
-
-```bash
-open1c project add TMS C:\Sources\TMS
-open1c project scan TMS
-open1c project list
-open1c project show TMS
+```powershell
+uv run open1c project analyze TMS --force
 ```
 
-A repeated scan is idempotent. It records new and changed files, keeps unchanged files,
-and removes database records for files that disappeared from the source directory. Source
-files themselves are never modified.
+## Collected knowledge
 
-Remove a project only from the analyzer catalog:
+The Analyzer Core stores:
 
-```bash
-open1c project remove TMS --yes
+- exported files, checksums, language and analysis status;
+- top-level metadata objects and selected child objects from XML/MDO exports;
+- configuration profile values such as compatibility mode when present in the export;
+- BSL modules, procedures, functions, parameters, export flags, regions and directives;
+- method calls with same-module, qualified and unique-export resolution;
+- query text and table usage for read, write, update and delete operations;
+- explicit references to documents, catalogs, registers and other metadata managers;
+- resolved and unresolved dependency edges between metadata, modules, methods and queries.
+
+This is static analysis. Dynamic execution, names assembled at runtime and some
+platform-specific implicit relationships can remain unresolved; they are kept in
+the database as unresolved facts instead of being guessed.
+
+## Inspection commands
+
+```powershell
+uv run open1c project find TMS РассчитатьПотребность
+uv run open1c project callers TMS РассчитатьПотребность
+uv run open1c project callees TMS РассчитатьПотребность
+uv run open1c project dependencies TMS РегистрНакопления.Запасы
+uv run open1c project dependencies TMS РассчитатьПотребность --outgoing
+uv run open1c project queries TMS
+uv run open1c project queries TMS РегистрНакопления.Запасы
 ```
 
-## Implemented scope
+Export a structured snapshot for the future task-analysis and LLM layer:
 
-### PR-001
+```powershell
+uv run open1c project snapshot TMS .open1c\tms-snapshot.json
+```
 
-- Python package skeleton
-- SQLite storage via SQLAlchemy 2.x
-- Alembic migrations
-- Typer CLI
-- Tests and CI
+## One-command verification
 
-### PR-002
+```powershell
+uv run open1c check
+```
 
-- Named project catalog with source directories
-- Recursive source-file discovery
-- SHA-256 checksums and language classification
-- Idempotent rescan with added, updated, unchanged, and removed counters
-- Project CLI commands and tests
+The command applies safe Ruff fixes and formatting, then runs mypy and pytest.
+
+## Current milestone
+
+- repository, SQLite storage, Alembic migrations and CLI;
+- project catalog and incremental file scanning;
+- BSL and metadata parsing;
+- call, query, reference and dependency graph construction;
+- search, graph inspection, summary and JSON snapshot export.
+
+The next layer will consume this graph to select context for a real task, perform
+impact analysis and prepare an explainable 1C code-change plan and patch.
