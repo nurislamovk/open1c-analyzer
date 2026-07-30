@@ -1,5 +1,8 @@
 """Open1C Analyzer command-line interface."""
 
+import subprocess
+import sys
+
 import typer
 from sqlalchemy import text
 
@@ -37,28 +40,40 @@ def init() -> None:
 def doctor() -> None:
     """Check configuration and database connectivity."""
     settings = Settings()
-    checks: list[tuple[str, bool, str]] = []
-
-    checks.append(
+    checks: list[tuple[str, bool, str]] = [
         (
             "Database directory",
             settings.database_path.parent.exists(),
             str(settings.database_path.parent),
         )
-    )
-
+    ]
     try:
         with database_session() as session:
             session.execute(text("SELECT 1"))
         checks.append(("SQLite connection", True, settings.database_url))
-    except Exception as exc:  # pragma: no cover - defensive CLI reporting
+    except Exception as exc:  # pragma: no cover
         checks.append(("SQLite connection", False, str(exc)))
-
     failed = False
     for name, ok, detail in checks:
-        marker = "[green]OK[/green]" if ok else "[red]FAIL[/red]"
-        console.print(f"{marker} {name}: {detail}")
+        console.print(f"{'[green]OK[/green]' if ok else '[red]FAIL[/red]'} {name}: {detail}")
         failed = failed or not ok
-
     if failed:
         raise typer.Exit(code=1)
+
+
+@app.command("check")
+def check_project() -> None:
+    """Run lint, formatting, type checks and tests with one command."""
+    commands = [
+        ("Ruff format", [sys.executable, "-m", "ruff", "format", "."]),
+        ("Ruff autofix", [sys.executable, "-m", "ruff", "check", "--fix", "."]),
+        ("Ruff verify", [sys.executable, "-m", "ruff", "check", "."]),
+        ("mypy", [sys.executable, "-m", "mypy", "src"]),
+        ("pytest", [sys.executable, "-m", "pytest"]),
+    ]
+    for label, command in commands:
+        console.print(f"[bold]{label}[/bold]")
+        completed = subprocess.run(command, check=False)
+        if completed.returncode:
+            raise typer.Exit(code=completed.returncode)
+    console.print("[green]All checks passed.[/green]")
