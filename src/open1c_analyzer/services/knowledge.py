@@ -34,6 +34,7 @@ class Summary:
     calls: int
     resolved_calls: int
     ambiguous_calls: int
+    built_in_calls: int
     unresolved_calls: int
     queries: int
     dependencies: int
@@ -75,6 +76,7 @@ class KnowledgeService:
             self._count(CallSite, project.id),
             self._count(CallSite, project.id, CallSite.resolved_symbol_id.is_not(None)),
             self._count(CallSite, project.id, CallSite.resolution == "ambiguous"),
+            self._count(CallSite, project.id, CallSite.resolution == "built_in"),
             self._count(CallSite, project.id, CallSite.resolution == "unresolved"),
             self._count(QueryFact, project.id),
             self._count(Dependency, project.id),

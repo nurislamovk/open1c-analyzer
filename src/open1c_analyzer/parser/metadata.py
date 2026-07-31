@@ -24,6 +24,8 @@ _TYPE_RE = re.compile(
     re.IGNORECASE,
 )
 _PROFILE_KEYS = {"CompatibilityMode", "DefaultRunMode", "DataLockControlMode"}
+_GENERIC_KIND_RE = re.compile(r"[^0-9A-Za-zА-Яа-яЁё_]+")
+_WRAPPER_TAGS = {"MetaDataObject", "MetaDataObjectCollection"}
 _PROPERTY_KEYS = _PROFILE_KEYS | {
     "Name",
     "Comment",
@@ -70,7 +72,10 @@ class MetadataParser:
         root = ET.fromstring(text)
         main = self._main(root)
         fallback_kind, fallback_name = self._path_identity(relative_path)
-        kind = XML_KIND_MAP.get(local_name(main.tag), fallback_kind)
+        main_tag = local_name(main.tag)
+        kind = XML_KIND_MAP.get(main_tag)
+        if kind is None:
+            kind = fallback_kind if main_tag in _WRAPPER_TAGS else self._generic_kind(main_tag)
         name = self._name(main) or fallback_name or local_name(main.tag)
         full_name = full_metadata_name(kind, name)
         objects = [self._item(main, kind, name, full_name, None)]
@@ -95,18 +100,36 @@ class MetadataParser:
     def _main(root: ET.Element) -> ET.Element:
         if local_name(root.tag) in XML_KIND_MAP:
             return root
-        return next((child for child in root if local_name(child.tag) in XML_KIND_MAP), root)
+        recognized = next(
+            (child for child in root if local_name(child.tag) in XML_KIND_MAP),
+            None,
+        )
+        if recognized is not None:
+            return recognized
+        children = list(root)
+        if local_name(root.tag) in _WRAPPER_TAGS and len(children) == 1:
+            return children[0]
+        return root
 
     @staticmethod
     def _path_identity(relative_path: str) -> tuple[str, str]:
         path = PurePosixPath(relative_path.replace("\\", "/"))
         parts = list(path.parts)
         for index, part in enumerate(parts):
-            if part in DIRECTORY_KIND_MAP and index + 1 < len(parts):
+            if index + 1 >= len(parts):
+                continue
+            if part in DIRECTORY_KIND_MAP:
                 return DIRECTORY_KIND_MAP[part], PurePosixPath(parts[index + 1]).stem
+            if index == 0:
+                return MetadataParser._generic_kind(part), PurePosixPath(parts[index + 1]).stem
         if path.name.casefold() == "configuration.xml":
             return "configuration", "Configuration"
         return "metadata", path.stem
+
+    @staticmethod
+    def _generic_kind(value: str) -> str:
+        normalized = _GENERIC_KIND_RE.sub("_", value).strip("_").casefold()
+        return normalized or "metadata"
 
     @staticmethod
     def _name(element: ET.Element) -> str | None:

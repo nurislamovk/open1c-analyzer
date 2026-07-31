@@ -118,6 +118,7 @@ def analyze_project(
             f"symbols {result.symbols}; calls {result.calls}; queries {result.queries}; "
             f"dependencies {result.dependencies}"
         )
+        console.print(f"Graph: {'rebuilt' if result.graph_rebuilt else 'reused'}")
         console.print(f"Unresolved calls: {result.unresolved_calls}")
         for error in result.errors:
             console.print(f"[yellow]WARN[/yellow] {error}")
