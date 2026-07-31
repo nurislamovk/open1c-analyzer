@@ -137,7 +137,6 @@ class ProjectCatalog:
             relative_path = path.relative_to(root).as_posix()
             seen.add(relative_path)
             stat = path.stat()
-            checksum = self._checksum(path)
             language = _LANGUAGE_BY_SUFFIX.get(path.suffix.lower(), "unknown")
             current = existing.get(relative_path)
 
@@ -145,7 +144,7 @@ class ProjectCatalog:
                 self._files.add(
                     project_id=project.id,
                     relative_path=relative_path,
-                    checksum=checksum,
+                    checksum=self._checksum(path),
                     language=language,
                     size_bytes=stat.st_size,
                     modified_ns=stat.st_mtime_ns,
@@ -153,17 +152,20 @@ class ProjectCatalog:
                 added += 1
                 continue
 
-            if current.checksum == checksum:
-                current.size_bytes = stat.st_size
-                current.modified_ns = stat.st_mtime_ns
+            if current.size_bytes == stat.st_size and current.modified_ns == stat.st_mtime_ns:
                 current.language = language
                 unchanged += 1
                 continue
 
-            current.checksum = checksum
-            current.language = language
+            checksum = self._checksum(path)
             current.size_bytes = stat.st_size
             current.modified_ns = stat.st_mtime_ns
+            current.language = language
+            if current.checksum == checksum:
+                unchanged += 1
+                continue
+
+            current.checksum = checksum
             updated += 1
 
         removed = self._files.remove_not_in(project.id, seen)

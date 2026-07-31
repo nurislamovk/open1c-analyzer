@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -33,7 +34,7 @@ def _metadata(path: Path, tag: str, name: str) -> None:
     )
 
 
-def test_builds_graph_and_snapshot(tmp_path: Path) -> None:
+def test_builds_graph_and_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     source = tmp_path / "configuration"
     _metadata(source / "CommonModules" / "Планирование.xml", "CommonModule", "Планирование")
     _metadata(source / "Documents" / "ЗаказПокупателя.xml", "Document", "ЗаказПокупателя")
@@ -52,6 +53,7 @@ def test_builds_graph_and_snapshot(tmp_path: Path) -> None:
     | Остатки.КоличествоОстаток
     |ИЗ
     | РегистрНакопления.ОстаткиТоваров.Остатки(&Дата, Склад = &Склад) КАК Остатки";
+    Сообщить("Проверка");
     Возврат Запрос.Выполнить();
 КонецФункции""",
         encoding="utf-8",
@@ -67,8 +69,14 @@ def test_builds_graph_and_snapshot(tmp_path: Path) -> None:
 
     with _session() as session:
         ProjectCatalog(session).add_project("Demo", source)
-        first = AnalyzerCore(session).analyze_project("Demo")
-        second = AnalyzerCore(session).analyze_project("Demo")
+        analyzer = AnalyzerCore(session)
+        first = analyzer.analyze_project("Demo")
+
+        def unexpected_resolve(_project: object) -> None:
+            raise AssertionError("An unchanged project must reuse its existing graph")
+
+        monkeypatch.setattr(analyzer, "_resolve", unexpected_resolve)
+        second = analyzer.analyze_project("Demo")
         service = KnowledgeService(session)
         summary = service.summary("Demo")
         callers = service.callers("Demo", "ПолучитьОстаток")
@@ -82,9 +90,27 @@ def test_builds_graph_and_snapshot(tmp_path: Path) -> None:
     assert first.queries == 1
     assert second.analyzed_files == 0
     assert second.skipped_files == 5
+    assert second.graph_rebuilt is False
     assert summary.resolved_calls >= 1
+    assert summary.built_in_calls >= 1
     assert callers[0].caller.endswith("ОбработкаПроведения")
     assert query_usage[0]["resolved"] is True
     payload = json.loads(snapshot.read_text(encoding="utf-8"))
     assert payload["schema"] == "open1c-analyzer-snapshot-v1"
     assert payload["summary"]["symbols"] == 2
+
+
+def test_metadata_conflict_isolated_to_one_file(tmp_path: Path) -> None:
+    source = tmp_path / "configuration"
+    _metadata(source / "A" / "Duplicate.xml", "FunctionalOption", "Duplicate")
+    _metadata(source / "B" / "Duplicate.xml", "FunctionalOption", "Duplicate")
+    _metadata(source / "C" / "After.xml", "CustomThing", "After")
+
+    with _session() as session:
+        ProjectCatalog(session).add_project("Conflicts", source)
+        result = AnalyzerCore(session).analyze_project("Conflicts")
+
+    assert result.analyzed_files == 2
+    assert result.metadata_objects == 2
+    assert len(result.errors) == 1
+    assert "UNIQUE constraint failed" in result.errors[0]

@@ -86,10 +86,27 @@ class SourceFileRepository:
         return int(self._session.scalar(statement) or 0)
 
     def remove_not_in(self, project_id: int, relative_paths: Collection[str]) -> int:
-        """Delete files that are no longer present in the source directory."""
-        statement = delete(SourceFile).where(SourceFile.project_id == project_id)
-        if relative_paths:
-            statement = statement.where(SourceFile.relative_path.not_in(relative_paths))
-        result = self._session.execute(statement)
+        """Delete files that are no longer present in the source directory.
+
+        SQLite limits the number of bound parameters in one statement. A large
+        configuration can contain tens of thousands of files, so a single
+        ``NOT IN (...)`` predicate is not safe here. Compare paths in Python and
+        delete stale rows by primary key in bounded batches instead.
+        """
+        retained_paths = set(relative_paths)
+        statement = select(SourceFile.id, SourceFile.relative_path).where(
+            SourceFile.project_id == project_id
+        )
+        stale_ids = [
+            source_file_id
+            for source_file_id, relative_path in self._session.execute(statement)
+            if relative_path not in retained_paths
+        ]
+
+        batch_size = 500
+        for offset in range(0, len(stale_ids), batch_size):
+            batch = stale_ids[offset : offset + batch_size]
+            self._session.execute(delete(SourceFile).where(SourceFile.id.in_(batch)))
+
         self._session.flush()
-        return int(getattr(result, "rowcount", 0) or 0)
+        return len(stale_ids)

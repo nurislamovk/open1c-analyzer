@@ -49,3 +49,33 @@ def test_metadata_parser_extracts_children_references_and_profile() -> None:
     ]
     assert parsed.references[0].target_full_name == "Справочник.Склады"
     assert parsed.profile["CompatibilityMode"] == "Version8_3_17"
+
+
+def test_metadata_parser_recognizes_functional_options() -> None:
+    text = """<MetaDataObject><FunctionalOption><Properties>
+    <Name>АвтономнаяРабота</Name><Synonym><item><content>Автономная работа</content>
+    </item></Synonym></Properties></FunctionalOption></MetaDataObject>"""
+
+    parsed = MetadataParser().parse(
+        text,
+        "FunctionalOptions/АвтономнаяРабота.xml",
+    )
+
+    assert parsed.objects[0].kind == "functional_option"
+    assert parsed.objects[0].full_name == "ФункциональнаяОпция.АвтономнаяРабота"
+
+
+def test_metadata_parser_keeps_unknown_object_kinds_distinct() -> None:
+    first = MetadataParser().parse(
+        "<MetaDataObject><FirstKind><Properties><Name>ОбщийОбъект</Name>"
+        "</Properties></FirstKind></MetaDataObject>",
+        "FirstKinds/ОбщийОбъект.xml",
+    )
+    second = MetadataParser().parse(
+        "<MetaDataObject><SecondKind><Properties><Name>ОбщийОбъект</Name>"
+        "</Properties></SecondKind></MetaDataObject>",
+        "SecondKinds/ОбщийОбъект.xml",
+    )
+
+    assert first.objects[0].full_name == "firstkind.ОбщийОбъект"
+    assert second.objects[0].full_name == "secondkind.ОбщийОбъект"

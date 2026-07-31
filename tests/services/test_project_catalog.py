@@ -44,7 +44,9 @@ def test_add_project_rejects_missing_directory(tmp_path: Path) -> None:
         ProjectCatalog(session).add_project("Missing", tmp_path / "missing")
 
 
-def test_scan_is_idempotent_and_tracks_changes(tmp_path: Path) -> None:
+def test_scan_is_idempotent_and_tracks_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     module = tmp_path / "CommonModules" / "Demo" / "Module.bsl"
     module.parent.mkdir(parents=True)
     module.write_text("procedure Test()", encoding="utf-8")
@@ -63,8 +65,13 @@ def test_scan_is_idempotent_and_tracks_changes(tmp_path: Path) -> None:
         assert (first.added, first.updated, first.unchanged, first.removed) == (2, 0, 0, 0)
         assert first.total == 2
 
+        def unexpected_checksum(_path: Path) -> str:
+            raise AssertionError("Unchanged files must not be checksummed again")
+
+        monkeypatch.setattr(catalog, "_checksum", unexpected_checksum)
         second = catalog.scan_project("Demo")
         assert (second.added, second.updated, second.unchanged, second.removed) == (0, 0, 2, 0)
+        monkeypatch.undo()
 
         module.write_text("procedure Changed()", encoding="utf-8")
         metadata.unlink()

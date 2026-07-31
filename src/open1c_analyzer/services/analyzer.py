@@ -80,6 +80,7 @@ class AnalysisResult:
     unresolved_calls: int
     queries: int
     dependencies: int
+    graph_rebuilt: bool
     errors: tuple[str, ...]
 
 
@@ -115,20 +116,22 @@ class AnalyzerCore:
             ):
                 skipped += 1
                 continue
-            self._clear_file(source_file.id)
+            relative_path = source_file.relative_path
             try:
-                source_path = root.joinpath(*PurePosixPath(source_file.relative_path).parts)
-                text = read_text(source_path)
-                if source_file.language == "bsl":
-                    self._store_bsl(project, source_file, text)
-                else:
-                    profile.update(self._store_metadata(project, source_file, text))
-                source_file.analyzed_checksum = source_file.checksum
-                source_file.analyzed_at = datetime.now(UTC)
-                source_file.analysis_error = None
+                with self.session.begin_nested():
+                    self._clear_file(source_file.id)
+                    source_path = root.joinpath(*PurePosixPath(relative_path).parts)
+                    text = read_text(source_path)
+                    if source_file.language == "bsl":
+                        self._store_bsl(project, source_file, text)
+                    else:
+                        profile.update(self._store_metadata(project, source_file, text))
+                    source_file.analyzed_checksum = source_file.checksum
+                    source_file.analyzed_at = datetime.now(UTC)
+                    source_file.analysis_error = None
                 analyzed += 1
             except Exception as exc:
-                message = f"{source_file.relative_path}: {type(exc).__name__}: {exc}"
+                message = f"{relative_path}: {type(exc).__name__}: {exc}"
                 source_file.analysis_error = message
                 source_file.analyzed_checksum = None
                 errors.append(message)
@@ -136,7 +139,9 @@ class AnalyzerCore:
         project.profile_json = (
             json.dumps(profile, ensure_ascii=False, sort_keys=True) if profile else None
         )
-        self._resolve(project)
+        graph_rebuilt = force or analyzed > 0 or bool(scan_result and scan_result.removed)
+        if graph_rebuilt:
+            self._resolve(project)
         project.last_analyzed_at = datetime.now(UTC)
         self.session.flush()
         counts = self._counts(project.id)
@@ -161,6 +166,7 @@ class AnalyzerCore:
             unresolved,
             counts["queries"],
             counts["dependencies"],
+            graph_rebuilt,
             tuple(errors),
         )
 
