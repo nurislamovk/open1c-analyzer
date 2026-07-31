@@ -16,7 +16,10 @@ def test_upgrade_from_project_catalog_to_analyzer_core(tmp_path) -> None:  # typ
 
     engine = create_engine(settings.database_url)
     try:
-        tables = set(inspect(engine).get_table_names())
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        call_indexes = {item["name"] for item in inspector.get_indexes("call_sites")}
+        dependency_indexes = {item["name"] for item in inspector.get_indexes("dependencies")}
     finally:
         engine.dispose()
 
@@ -29,3 +32,13 @@ def test_upgrade_from_project_catalog_to_analyzer_core(tmp_path) -> None:  # typ
         "references",
         "symbols",
     } <= tables
+
+    assert {
+        "ix_calls_project_caller",
+        "ix_calls_project_resolved",
+        "ix_calls_project_resolution",
+    } <= call_indexes
+    assert {
+        "ix_dependencies_project_source_identity",
+        "ix_dependencies_project_target_identity",
+    } <= dependency_indexes
