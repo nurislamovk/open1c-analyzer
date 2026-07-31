@@ -164,7 +164,12 @@ class CallSite(Base):
     """A method call found in BSL."""
 
     __tablename__ = "call_sites"
-    __table_args__ = (Index("ix_calls_project_target", "project_id", "normalized_name"),)
+    __table_args__ = (
+        Index("ix_calls_project_target", "project_id", "normalized_name"),
+        Index("ix_calls_project_caller", "project_id", "caller_symbol_id"),
+        Index("ix_calls_project_resolved", "project_id", "resolved_symbol_id"),
+        Index("ix_calls_project_resolution", "project_id", "resolution"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     project_id: Mapped[int] = mapped_column(
@@ -192,7 +197,10 @@ class QueryFact(Base):
     """A query-language text embedded in BSL."""
 
     __tablename__ = "queries"
-    __table_args__ = (Index("ix_queries_project_kind", "project_id", "kind"),)
+    __table_args__ = (
+        Index("ix_queries_project_kind", "project_id", "kind"),
+        Index("ix_queries_project_symbol", "project_id", "symbol_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     project_id: Mapped[int] = mapped_column(
@@ -248,6 +256,18 @@ class Dependency(Base):
     __table_args__ = (
         Index("ix_dependencies_project_source", "project_id", "source_name"),
         Index("ix_dependencies_project_target", "project_id", "target_name"),
+        Index(
+            "ix_dependencies_project_source_identity",
+            "project_id",
+            "source_kind",
+            "source_id",
+        ),
+        Index(
+            "ix_dependencies_project_target_identity",
+            "project_id",
+            "target_kind",
+            "target_id",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)

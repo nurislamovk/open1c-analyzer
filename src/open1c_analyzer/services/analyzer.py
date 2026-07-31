@@ -13,7 +13,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from open1c_analyzer.parser import BslAnalyzer, MetadataParser, identify_module, read_text
-from open1c_analyzer.parser.names import full_metadata_name, normalize
+from open1c_analyzer.parser.names import MANAGER_KIND, full_metadata_name, normalize
 from open1c_analyzer.services.project_catalog import ProjectCatalog, SourceDirectoryError
 from open1c_analyzer.storage.models import (
     CallSite,
@@ -30,27 +30,36 @@ from open1c_analyzer.storage.models import (
 _BUILTINS = {
     normalize(item)
     for item in (
+        "Булево",
         "Вопрос",
         "Вычислить",
         "Дата",
         "ДобавитьМесяц",
         "ЗаполнитьЗначенияСвойств",
+        "ЗначениеВСтрокуВнутр",
         "ЗначениеЗаполнено",
+        "ЗначениеИзСтрокиВнутр",
         "Макс",
         "Мин",
-        "Найти",
+        "НачалоГода",
         "НачалоДня",
+        "НачалоКвартала",
         "НачалоМесяца",
+        "НачалоНедели",
         "НСтр",
         "ОписаниеОшибки",
         "Окр",
         "Предупреждение",
         "ПустаяСтрока",
+        "СокрЛ",
         "СокрЛП",
+        "СокрП",
         "Сообщить",
+        "Сред",
         "СтрДлина",
         "СтрЗаменить",
         "СтрНайти",
+        "СтрПолучитьСтроку",
         "СтрРазделить",
         "СтрСоединить",
         "ТекущаяДата",
@@ -59,11 +68,172 @@ _BUILTINS = {
         "ТипЗнч",
         "Формат",
         "Число",
+        "ВРег",
+        "ИнформацияОбОшибке",
+        "Лев",
+        "НРег",
+        "ПредопределенноеЗначение",
+        "СтрНачинаетсяС",
+        "СтрЧислоВхождений",
+        "СтрЗаканчиваетсяНа",
+        "СтрСравнить",
+        "СтрШаблон",
+        "Строка",
+        "КонецГода",
+        "КонецДня",
+        "КонецКвартала",
+        "КонецМесяца",
+        "КонецНедели",
+        "Год",
+        "Месяц",
+        "День",
+        "ДеньНедели",
+        "ДеньГода",
+        "НеделяГода",
+        "Час",
+        "Минута",
+        "Секунда",
+        "Символ",
+        "Base64Строка",
+        "Прав",
+        "Найти",
+        "Цел",
         "String",
         "Number",
         "Type",
     )
 }
+
+_PLATFORM_GLOBALS = {
+    normalize(item)
+    for item in (
+        "ВыполнитьОбработкуОповещения",
+        "ЗафиксироватьТранзакцию",
+        "ЗаписьЖурналаРегистрации",
+        "Запрос",
+        "Массив",
+        "НачатьТранзакцию",
+        "ОписаниеОповещения",
+        "ОписаниеТипов",
+        "ОткрытьФорму",
+        "ОтменитьТранзакцию",
+        "ПоказатьВопрос",
+        "ПоказатьПредупреждение",
+        "ПодключитьОбработчикОжидания",
+        "ПолеКомпоновкиДанных",
+        "ПолучитьИзВременногоХранилища",
+        "ПолучитьФункциональнуюОпцию",
+        "ПоместитьВоВременноеХранилище",
+        "Структура",
+        "УстановитьПривилегированныйРежим",
+        "Оповестить",
+        "ОчиститьСообщения",
+        "ПравоДоступа",
+        "РеквизитФормыВЗначение",
+        "ЗначениеВРеквизитФормы",
+        "ПолучитьМакет",
+        "XMLСтрока",
+        "ПоказатьЗначение",
+        "ПолучитьИмяВременногоФайла",
+        "ПодробноеПредставлениеОшибки",
+        "ПоказатьОповещениеПользователя",
+        "КвалификаторыСтроки",
+        "КвалификаторыЧисла",
+        "КвалификаторыДаты",
+        "ФиксированнаяСтруктура",
+        "ХранилищеЗначения",
+        "Соответствие",
+        "ФиксированноеСоответствие",
+        "Цвет",
+        "ФиксированныйМассив",
+        "ЭтоАдресВременногоХранилища",
+        "ЗначениеВДанныеФормы",
+        "КопироватьДанныеФормы",
+        "ДанныеФормыВЗначение",
+        "УдалитьФайлы",
+        "Состояние",
+        "ПолучитьНавигационнуюСсылку",
+        "Файл",
+        "ПолучитьФорму",
+        "ДвоичныеДанные",
+        "УдалитьИзВременногоХранилища",
+        "ПредставлениеПериода",
+        "Шрифт",
+        "ПараметрВыбора",
+        "УстановитьОтключениеБезопасногоРежима",
+        "СжатиеДанных",
+        "ТекущаяУниверсальнаяДата",
+        "Линия",
+        "СоздатьНаборЗаписей",
+        "ПустаяСсылка",
+        "ОповеститьОбИзменении",
+        "ОповеститьОВыборе",
+        "ТекущаяУниверсальнаяДатаВМиллисекундах",
+    )
+}
+
+# False call rows created by older parser versions can remain in an existing index.
+# Remove them during graph resolution so a full source reindex is not required.
+_PARSER_NOISE = {
+    normalize(item)
+    for item in (
+        "and",
+        "do",
+        "else",
+        "elseif",
+        "for",
+        "function",
+        "if",
+        "new",
+        "not",
+        "or",
+        "procedure",
+        "return",
+        "then",
+        "to",
+        "try",
+        "while",
+        "возврат",
+        "вызватьисключение",
+        "для",
+        "если",
+        "и",
+        "иначе",
+        "иначеесли",
+        "или",
+        "не",
+        "новый",
+        "по",
+        "пока",
+        "попытка",
+        "процедура",
+        "тогда",
+        "функция",
+        "цикл",
+    )
+}
+
+_PLATFORM_QUALIFIERS = {
+    normalize(item)
+    for item in (
+        "ЭтотОбъект",
+        "ThisObject",
+        "Объект",
+        "Object",
+        "Элементы",
+        "Elements",
+        "Параметры",
+        "Parameters",
+        "Команды",
+        "Commands",
+        "ПользователиИнформационнойБазы",
+        "РегламентныеЗадания",
+        "ФоновыеЗадания",
+        "Метаданные",
+        "Metadata",
+    )
+}
+_MANAGER_QUALIFIERS = {normalize(item) for item in MANAGER_KIND}
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +252,18 @@ class AnalysisResult:
     dependencies: int
     graph_rebuilt: bool
     errors: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ResolutionResult:
+    calls: int
+    resolved: int
+    ambiguous: int
+    built_in: int
+    platform: int
+    dynamic: int
+    unresolved: int
+    dependencies: int
 
 
 class AnalyzerCore:
@@ -148,7 +330,7 @@ class AnalyzerCore:
         unresolved = int(
             self.session.scalar(
                 select(func.count(CallSite.id)).where(
-                    CallSite.project_id == project.id, CallSite.resolution == "unresolved"
+                    CallSite.project_id == project.id, CallSite.resolution.like("unresolved%")
                 )
             )
             or 0
@@ -168,6 +350,28 @@ class AnalyzerCore:
             counts["dependencies"],
             graph_rebuilt,
             tuple(errors),
+        )
+
+    def resolve_project(self, name: str) -> ResolutionResult:
+        """Rebuild only call resolution and dependency edges for an indexed project."""
+        project = self.catalog.get_project(name)
+        self._resolve(project)
+        project.last_analyzed_at = datetime.now(UTC)
+        self.session.flush()
+        return ResolutionResult(
+            calls=self._call_count(project.id),
+            resolved=self._call_count(project.id, CallSite.resolved_symbol_id.is_not(None)),
+            ambiguous=self._call_count(project.id, CallSite.resolution.like("ambiguous%")),
+            built_in=self._call_count(project.id, CallSite.resolution == "built_in"),
+            platform=self._call_count(project.id, CallSite.resolution == "platform_api"),
+            dynamic=self._call_count(project.id, CallSite.resolution == "dynamic_qualified"),
+            unresolved=self._call_count(project.id, CallSite.resolution.like("unresolved%")),
+            dependencies=int(
+                self.session.scalar(
+                    select(func.count(Dependency.id)).where(Dependency.project_id == project.id)
+                )
+                or 0
+            ),
         )
 
     @staticmethod
@@ -326,6 +530,12 @@ class AnalyzerCore:
 
     def _resolve(self, project: Project) -> None:
         self.session.execute(delete(Dependency).where(Dependency.project_id == project.id))
+        self.session.execute(
+            delete(CallSite).where(
+                CallSite.project_id == project.id,
+                CallSite.normalized_name.in_(_PARSER_NOISE),
+            )
+        )
         metadata = list(
             self.session.scalars(
                 select(MetadataObject).where(MetadataObject.project_id == project.id)
@@ -337,6 +547,7 @@ class AnalyzerCore:
         metadata_by_kind_name = {(item.kind, normalize(item.name)): item for item in metadata}
         modules_by_id = {item.id: item for item in modules}
         modules_by_file = {item.source_file_id: item for item in modules}
+        module_qualifiers = {normalize(item.name) for item in modules}
 
         for module in modules:
             owner = (
@@ -380,26 +591,53 @@ class AnalyzerCore:
         )
         for call in calls:
             call.resolved_symbol_id = None
-            call.resolution = "unresolved"
+            call.resolution = "unresolved_unqualified"
             caller = symbols_by_id.get(call.caller_symbol_id) if call.caller_symbol_id else None
             candidates: list[Symbol] = []
+            qualifier_root = normalize(call.qualifier.split(".")[0]) if call.qualifier else ""
             if call.qualifier:
-                candidates = qualified.get(
-                    (normalize(call.qualifier.split(".")[0]), call.normalized_name), []
-                )
-                if len(candidates) == 1:
-                    call.resolution = "qualified"
+                if caller and qualifier_root in {normalize("ЭтотОбъект"), normalize("ThisObject")}:
+                    candidates = local_symbols.get((caller.module_id, call.normalized_name), [])
+                    if len(candidates) == 1:
+                        call.resolution = "same_module_object"
+                if not candidates:
+                    candidates = qualified.get((qualifier_root, call.normalized_name), [])
+                    if len(candidates) == 1:
+                        call.resolution = "qualified_module"
+                if len(candidates) > 1:
+                    call.resolution = "ambiguous_qualified"
+                elif not candidates:
+                    if (
+                        qualifier_root in _PLATFORM_QUALIFIERS
+                        or qualifier_root in _MANAGER_QUALIFIERS
+                    ):
+                        call.resolution = "platform_api"
+                    elif qualifier_root in module_qualifiers:
+                        call.resolution = "unresolved_qualified"
+                    else:
+                        call.resolution = "dynamic_qualified"
             elif caller:
                 candidates = local_symbols.get((caller.module_id, call.normalized_name), [])
                 if len(candidates) == 1:
                     call.resolution = "same_module"
-                elif not candidates:
-                    candidates = exported.get(call.normalized_name, [])
-                    if len(candidates) == 1:
-                        call.resolution = "unique_export"
-            if len(candidates) > 1:
-                call.resolution = "ambiguous"
-            elif len(candidates) == 1:
+                elif len(candidates) > 1:
+                    call.resolution = "ambiguous_local"
+                else:
+                    common_candidates = [
+                        item
+                        for item in exported.get(call.normalized_name, [])
+                        if modules_by_id[item.module_id].owner_kind == "common_module"
+                    ]
+                    if len(common_candidates) == 1:
+                        candidates = common_candidates
+                        call.resolution = "global_common_module"
+                    else:
+                        candidates = exported.get(call.normalized_name, [])
+                        if len(candidates) == 1:
+                            call.resolution = "unique_export"
+                        elif len(candidates) > 1:
+                            call.resolution = "ambiguous_export"
+            if len(candidates) == 1:
                 target_symbol = candidates[0]
                 call.resolved_symbol_id = target_symbol.id
                 caller_module = modules_by_file.get(call.source_file_id)
@@ -423,8 +661,10 @@ class AnalyzerCore:
                     call.line,
                     True,
                 )
-            elif call.normalized_name in _BUILTINS:
+            elif not call.qualifier and call.normalized_name in _BUILTINS:
                 call.resolution = "built_in"
+            elif not call.qualifier and call.normalized_name in _PLATFORM_GLOBALS:
+                call.resolution = "platform_api"
 
         for reference in self.session.scalars(
             select(Reference).where(Reference.project_id == project.id)
@@ -566,6 +806,16 @@ class AnalyzerCore:
             }
         except (TypeError, ValueError):
             return {}
+
+    def _call_count(self, project_id: int, *conditions: Any) -> int:
+        return int(
+            self.session.scalar(
+                select(func.count(CallSite.id)).where(
+                    CallSite.project_id == project_id, *conditions
+                )
+            )
+            or 0
+        )
 
     def _counts(self, project_id: int) -> dict[str, int]:
         models: dict[str, type[Any]] = {

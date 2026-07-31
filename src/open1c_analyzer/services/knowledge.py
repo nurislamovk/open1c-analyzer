@@ -35,6 +35,8 @@ class Summary:
     resolved_calls: int
     ambiguous_calls: int
     built_in_calls: int
+    platform_calls: int
+    dynamic_calls: int
     unresolved_calls: int
     queries: int
     dependencies: int
@@ -75,9 +77,11 @@ class KnowledgeService:
             self._count(Symbol, project.id, Symbol.is_export.is_(True)),
             self._count(CallSite, project.id),
             self._count(CallSite, project.id, CallSite.resolved_symbol_id.is_not(None)),
-            self._count(CallSite, project.id, CallSite.resolution == "ambiguous"),
+            self._count(CallSite, project.id, CallSite.resolution.like("ambiguous%")),
             self._count(CallSite, project.id, CallSite.resolution == "built_in"),
-            self._count(CallSite, project.id, CallSite.resolution == "unresolved"),
+            self._count(CallSite, project.id, CallSite.resolution == "platform_api"),
+            self._count(CallSite, project.id, CallSite.resolution == "dynamic_qualified"),
+            self._count(CallSite, project.id, CallSite.resolution.like("unresolved%")),
             self._count(QueryFact, project.id),
             self._count(Dependency, project.id),
             self._count(Dependency, project.id, Dependency.is_resolved.is_(False)),

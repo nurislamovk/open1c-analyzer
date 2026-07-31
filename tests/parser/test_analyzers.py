@@ -79,3 +79,16 @@ def test_metadata_parser_keeps_unknown_object_kinds_distinct() -> None:
 
     assert first.objects[0].full_name == "firstkind.ОбщийОбъект"
     assert second.objects[0].full_name == "secondkind.ОбщийОбъект"
+
+
+def test_bsl_analyzer_does_not_treat_language_keywords_as_calls() -> None:
+    text = """Процедура Проверить()
+    Если Истина И (Ложь ИЛИ Не (Истина)) Тогда
+        Возврат;
+    КонецЕсли;
+КонецПроцедуры
+"""
+
+    parsed = BslAnalyzer().parse(text)
+
+    assert [item.full_name for item in parsed.calls] == []

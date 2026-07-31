@@ -126,6 +126,24 @@ def analyze_project(
         _fail(str(exc))
 
 
+@project_app.command("resolve")
+def resolve_project(name: str) -> None:
+    """Rebuild call resolution and dependency edges without re-reading source files."""
+    try:
+        with database_session() as session:
+            result = AnalyzerCore(session).resolve_project(name)
+        console.print(f"Graph resolved: [bold]{name}[/bold]")
+        console.print(
+            f"Calls: {result.calls}; resolved {result.resolved}; "
+            f"ambiguous {result.ambiguous}; built-in {result.built_in}; "
+            f"platform {result.platform}; dynamic {result.dynamic}; "
+            f"unresolved {result.unresolved}"
+        )
+        console.print(f"Dependencies: {result.dependencies}")
+    except ProjectCatalogError as exc:
+        _fail(str(exc))
+
+
 @project_app.command("summary")
 def summary(name: str) -> None:
     """Show analysis readiness counters."""
