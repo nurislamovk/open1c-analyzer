@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -112,6 +113,55 @@ class RetrievalService:
                 break
             result.extend(self._find_project(project, term, remaining))
         return result
+
+    def symbols_for_entities(
+        self,
+        entities: Iterable[EntityRef],
+        *,
+        limit_per_entity: int = 20,
+    ) -> list[EntityRef]:
+        """Return bounded symbol candidates declared by metadata or module entities."""
+        if limit_per_entity < 1:
+            return []
+
+        result: list[EntityRef] = []
+        projects: dict[int, Project] = {}
+        files_by_project: dict[int, dict[int, str]] = {}
+        for entity in entities:
+            if entity.kind == "symbol":
+                result.append(entity)
+                continue
+
+            project = projects.get(entity.project_id)
+            if project is None:
+                project = self.session.get(Project, entity.project_id)
+                if project is None:
+                    continue
+                projects[entity.project_id] = project
+            files = files_by_project.setdefault(entity.project_id, self._files(entity.project_id))
+
+            statement = select(Symbol).where(Symbol.project_id == entity.project_id)
+            if entity.kind == "module":
+                statement = statement.where(Symbol.module_id == entity.id)
+            else:
+                statement = statement.join(Module, Symbol.module_id == Module.id).where(
+                    Module.metadata_object_id == entity.id
+                )
+            symbols = list(
+                self.session.scalars(
+                    statement.order_by(
+                        Symbol.directive.is_(None),
+                        Symbol.is_export.desc(),
+                        Symbol.line_start,
+                    ).limit(limit_per_entity)
+                )
+            )
+            modules = self._modules_for_symbols(symbols)
+            result.extend(
+                self._symbol_ref(project, symbol, modules[symbol.module_id], files)
+                for symbol in symbols
+            )
+        return self._deduplicate(result)
 
     def calls(
         self,
@@ -326,17 +376,17 @@ class RetrievalService:
             groups,
         )
 
-    def context(
+    def build_context(
         self,
         project_name: str,
         term: str,
-        output: Path,
         *,
         include: tuple[str, ...] = (),
         depth: int = 1,
         max_chars: int = 60_000,
         max_units: int = 30,
-    ) -> Path:
+    ) -> dict[str, Any]:
+        """Build a bounded context payload without writing it to disk."""
         projects = self._projects(project_name, include)
         project_by_id = {project.id: project for project in projects}
         matches = self.find(project_name, term, include=include, limit=20)
@@ -391,7 +441,7 @@ class RetrievalService:
         impact_rows = self._deduplicate_impact([*impact_rows, *context_outgoing])[:300]
         queries = self._queries(selected_symbol_ids, project_by_id)
         unresolved = self._unresolved_near(selected_symbol_ids, project_by_id)
-        payload = {
+        return {
             "schema": "open1c-analyzer-context-v1",
             "generated_at": datetime.now(UTC).isoformat(),
             "request": {
@@ -424,6 +474,27 @@ class RetrievalService:
                 "actual_source_characters": sum(len(str(item["source"])) for item in source_units),
             },
         }
+
+    def context(
+        self,
+        project_name: str,
+        term: str,
+        output: Path,
+        *,
+        include: tuple[str, ...] = (),
+        depth: int = 1,
+        max_chars: int = 60_000,
+        max_units: int = 30,
+    ) -> Path:
+        """Build and write a bounded, source-backed JSON context package."""
+        payload = self.build_context(
+            project_name,
+            term,
+            include=include,
+            depth=depth,
+            max_chars=max_chars,
+            max_units=max_units,
+        )
         target = output.expanduser().resolve()
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(

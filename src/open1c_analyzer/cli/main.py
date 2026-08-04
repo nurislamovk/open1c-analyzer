@@ -4,15 +4,17 @@ import subprocess
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import Annotated, Never
+from typing import Annotated, Never, cast
 
 import typer
+from rich.markdown import Markdown
 from rich.table import Table
 from sqlalchemy import text
 
 from open1c_analyzer.cli.common import console, database_session, migrate_database
 from open1c_analyzer.cli.project import project_app
 from open1c_analyzer.config import Settings
+from open1c_analyzer.services.ask import AskError, AskService, ReasoningEffort
 from open1c_analyzer.services.project_catalog import ProjectCatalogError
 from open1c_analyzer.services.retrieval import RetrievalService
 from open1c_analyzer.version import __version__
@@ -246,6 +248,93 @@ def context(
             )
         console.print(f"Context written: {path}")
     except ProjectCatalogError as exc:
+        _fail(str(exc))
+
+
+@app.command("ask")
+def ask(
+    project: str,
+    question: str,
+    include: Annotated[
+        list[str] | None,
+        typer.Option("--include", help="Include another analyzed project."),
+    ] = None,
+    term: Annotated[
+        str | None,
+        typer.Option("--term", help="Explicit metadata object, module or method entry point."),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="OpenAI model ID. Defaults to OPEN1C_OPENAI_MODEL."),
+    ] = None,
+    reasoning: Annotated[
+        str | None,
+        typer.Option("--reasoning", help="none, low, medium, high, xhigh or max"),
+    ] = None,
+    depth: Annotated[int, typer.Option("--depth", min=1, max=5)] = 2,
+    max_chars: Annotated[
+        int,
+        typer.Option("--max-chars", min=1000, max=1_000_000),
+    ] = 60_000,
+    max_units: Annotated[int, typer.Option("--max-units", min=1, max=200)] = 30,
+    max_prompt_chars: Annotated[
+        int,
+        typer.Option("--max-prompt-chars", min=20_000, max=4_000_000),
+    ] = 180_000,
+    max_output_tokens: Annotated[
+        int,
+        typer.Option("--max-output-tokens", min=100, max=128_000),
+    ] = 4_000,
+    output_root: Annotated[
+        Path | None,
+        typer.Option("--output-root", help="Directory for reproducible ask run artifacts."),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Build plan/context/prompt without calling OpenAI."),
+    ] = False,
+) -> None:
+    """Answer a 1C engineering question from indexed source with OpenAI."""
+    allowed_reasoning = {"none", "low", "medium", "high", "xhigh", "max"}
+    if reasoning is not None and reasoning not in allowed_reasoning:
+        _fail("Reasoning must be none, low, medium, high, xhigh or max.")
+    try:
+        with database_session() as session:
+            result = AskService(session).ask(
+                project,
+                question,
+                include=_include_tuple(include),
+                term=term,
+                model=model,
+                reasoning_effort=cast(ReasoningEffort | None, reasoning),
+                depth=depth,
+                max_chars=max_chars,
+                max_units=max_units,
+                max_prompt_chars=max_prompt_chars,
+                max_output_tokens=max_output_tokens,
+                output_root=output_root,
+                dry_run=dry_run,
+            )
+        console.print(f"Selected entry point: [bold]{result.selected_term}[/bold]")
+        console.print(f"Run directory: {result.run_directory}")
+        console.print(f"Context: {result.context_path}")
+        console.print(f"Prompt: {result.prompt_path}")
+        if result.dry_run:
+            console.print("[yellow]Dry run: no OpenAI request was sent.[/yellow]")
+            return
+        if result.answer:
+            console.print()
+            console.print(Markdown(result.answer))
+        if result.answer_path:
+            console.print(f"Answer: {result.answer_path}")
+        if result.total_tokens is not None:
+            console.print(
+                f"Tokens: input {result.input_tokens or 0}; "
+                f"output {result.output_tokens or 0}; total {result.total_tokens}"
+            )
+        if result.request_id:
+            console.print(f"OpenAI request ID: {result.request_id}")
+    except (AskError, ProjectCatalogError) as exc:
         _fail(str(exc))
 
 
