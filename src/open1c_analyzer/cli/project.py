@@ -97,11 +97,20 @@ def analyze_project(
     no_scan: Annotated[
         bool, typer.Option("--no-scan", help="Do not refresh the file catalog.")
     ] = False,
+    include: Annotated[
+        list[str] | None,
+        typer.Option("--include", help="Resolve against another analyzed project."),
+    ] = None,
 ) -> None:
     """Collect metadata, BSL, calls, queries and dependency edges."""
     try:
         with database_session() as session:
-            result = AnalyzerCore(session).analyze_project(name, force=force, scan=not no_scan)
+            result = AnalyzerCore(session).analyze_project(
+                name,
+                force=force,
+                scan=not no_scan,
+                include=tuple(include or ()),
+            )
         console.print(f"Project analyzed: [bold]{name}[/bold]")
         console.print(
             f"Scan changes: +{result.scanned_added} "
@@ -127,11 +136,17 @@ def analyze_project(
 
 
 @project_app.command("resolve")
-def resolve_project(name: str) -> None:
+def resolve_project(
+    name: str,
+    include: Annotated[
+        list[str] | None,
+        typer.Option("--include", help="Resolve against another analyzed project."),
+    ] = None,
+) -> None:
     """Rebuild call resolution and dependency edges without re-reading source files."""
     try:
         with database_session() as session:
-            result = AnalyzerCore(session).resolve_project(name)
+            result = AnalyzerCore(session).resolve_project(name, include=tuple(include or ()))
         console.print(f"Graph resolved: [bold]{name}[/bold]")
         console.print(
             f"Calls: {result.calls}; resolved {result.resolved}; "

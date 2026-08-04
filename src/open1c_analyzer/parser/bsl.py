@@ -379,7 +379,12 @@ class BslAnalyzer:
             while previous >= 0 and tokens[previous].kind == "newline":
                 previous -= 1
             declaration_name = previous >= 0 and tokens[previous].value.casefold() in _DECL
-            if parts[0].casefold() not in _EXCLUDE_CALLS and not declaration_name:
+            extension_annotation = previous >= 0 and tokens[previous].value == "&"
+            if (
+                parts[0].casefold() not in _EXCLUDE_CALLS
+                and not declaration_name
+                and not extension_annotation
+            ):
                 caller = self._symbol_at(symbols, token.line)
                 result.append(
                     ParsedCall(

@@ -195,14 +195,18 @@ _PARSER_NOISE = {
         "while",
         "возврат",
         "вызватьисключение",
+        "вместо",
         "для",
         "если",
         "и",
+        "изменениеиконтроль",
         "иначе",
         "иначеесли",
         "или",
         "не",
         "новый",
+        "перед",
+        "после",
         "по",
         "пока",
         "попытка",
@@ -276,7 +280,12 @@ class AnalyzerCore:
         self.metadata = MetadataParser()
 
     def analyze_project(
-        self, name: str, *, force: bool = False, scan: bool = True
+        self,
+        name: str,
+        *,
+        force: bool = False,
+        scan: bool = True,
+        include: tuple[str, ...] = (),
     ) -> AnalysisResult:
         project = self.catalog.get_project(name)
         if not project.source_path:
@@ -321,9 +330,11 @@ class AnalyzerCore:
         project.profile_json = (
             json.dumps(profile, ensure_ascii=False, sort_keys=True) if profile else None
         )
-        graph_rebuilt = force or analyzed > 0 or bool(scan_result and scan_result.removed)
+        graph_rebuilt = (
+            force or analyzed > 0 or bool(scan_result and scan_result.removed) or bool(include)
+        )
         if graph_rebuilt:
-            self._resolve(project)
+            self._resolve(project, self._included_projects(project, include))
         project.last_analyzed_at = datetime.now(UTC)
         self.session.flush()
         counts = self._counts(project.id)
@@ -352,10 +363,15 @@ class AnalyzerCore:
             tuple(errors),
         )
 
-    def resolve_project(self, name: str) -> ResolutionResult:
-        """Rebuild only call resolution and dependency edges for an indexed project."""
+    def resolve_project(
+        self,
+        name: str,
+        *,
+        include: tuple[str, ...] = (),
+    ) -> ResolutionResult:
+        """Rebuild call resolution, optionally using symbols from related projects."""
         project = self.catalog.get_project(name)
-        self._resolve(project)
+        self._resolve(project, self._included_projects(project, include))
         project.last_analyzed_at = datetime.now(UTC)
         self.session.flush()
         return ResolutionResult(
@@ -373,6 +389,21 @@ class AnalyzerCore:
                 or 0
             ),
         )
+
+    def _included_projects(
+        self,
+        primary: Project,
+        names: tuple[str, ...],
+    ) -> tuple[Project, ...]:
+        result: list[Project] = []
+        seen = {primary.id}
+        for name in names:
+            project = self.catalog.get_project(name)
+            if project.id in seen:
+                continue
+            result.append(project)
+            seen.add(project.id)
+        return tuple(result)
 
     @staticmethod
     def _analyzable(source_file: SourceFile) -> bool:
@@ -528,7 +559,11 @@ class AnalyzerCore:
         self.session.flush()
         return parsed.profile
 
-    def _resolve(self, project: Project) -> None:
+    def _resolve(
+        self,
+        project: Project,
+        included_projects: tuple[Project, ...] = (),
+    ) -> None:
         self.session.execute(delete(Dependency).where(Dependency.project_id == project.id))
         self.session.execute(
             delete(CallSite).where(
@@ -536,23 +571,54 @@ class AnalyzerCore:
                 CallSite.normalized_name.in_(_PARSER_NOISE),
             )
         )
-        metadata = list(
+
+        primary_metadata = list(
             self.session.scalars(
                 select(MetadataObject).where(MetadataObject.project_id == project.id)
             )
         )
-        modules = list(self.session.scalars(select(Module).where(Module.project_id == project.id)))
-        symbols = list(self.session.scalars(select(Symbol).where(Symbol.project_id == project.id)))
-        aliases = self._metadata_aliases(metadata)
-        metadata_by_kind_name = {(item.kind, normalize(item.name)): item for item in metadata}
-        modules_by_id = {item.id: item for item in modules}
-        modules_by_file = {item.source_file_id: item for item in modules}
-        module_qualifiers = {normalize(item.name) for item in modules}
+        primary_modules = list(
+            self.session.scalars(select(Module).where(Module.project_id == project.id))
+        )
+        primary_symbols = list(
+            self.session.scalars(select(Symbol).where(Symbol.project_id == project.id))
+        )
+        included_ids = tuple(item.id for item in included_projects)
+        included_metadata = (
+            list(
+                self.session.scalars(
+                    select(MetadataObject).where(MetadataObject.project_id.in_(included_ids))
+                )
+            )
+            if included_ids
+            else []
+        )
+        included_modules = (
+            list(self.session.scalars(select(Module).where(Module.project_id.in_(included_ids))))
+            if included_ids
+            else []
+        )
+        included_symbols = (
+            list(self.session.scalars(select(Symbol).where(Symbol.project_id.in_(included_ids))))
+            if included_ids
+            else []
+        )
 
-        for module in modules:
+        all_metadata = [*primary_metadata, *included_metadata]
+        all_modules = [*primary_modules, *included_modules]
+        aliases = self._metadata_aliases(all_metadata)
+        metadata_by_kind_name: dict[tuple[str, str], MetadataObject] = {}
+        for item in all_metadata:
+            metadata_by_kind_name.setdefault((item.kind, normalize(item.name)), item)
+        modules_by_id = {item.id: item for item in all_modules}
+        modules_by_file = {item.source_file_id: item for item in primary_modules}
+        module_qualifiers = {normalize(item.name) for item in all_modules}
+
+        for module in primary_modules:
+            owner_kind = module.owner_kind
             owner = (
-                metadata_by_kind_name.get((module.owner_kind, normalize(module.owner_name or "")))
-                if module.owner_kind
+                metadata_by_kind_name.get((owner_kind, normalize(module.owner_name or "")))
+                if owner_kind
                 else None
             )
             if owner:
@@ -572,20 +638,34 @@ class AnalyzerCore:
                 )
 
         local_symbols: dict[tuple[int, str], list[Symbol]] = {}
-        exported: dict[str, list[Symbol]] = {}
-        qualified: dict[tuple[str, str], list[Symbol]] = {}
-        for symbol in symbols:
+        primary_exported: dict[str, list[Symbol]] = {}
+        included_exported: dict[str, list[Symbol]] = {}
+        primary_qualified: dict[tuple[str, str], list[Symbol]] = {}
+        included_qualified: dict[tuple[str, str], list[Symbol]] = {}
+
+        for symbol in primary_symbols:
             local_symbols.setdefault((symbol.module_id, symbol.normalized_name), []).append(symbol)
             if symbol.is_export:
-                exported.setdefault(symbol.normalized_name, []).append(symbol)
+                primary_exported.setdefault(symbol.normalized_name, []).append(symbol)
             module = modules_by_id[symbol.module_id]
             for qualifier in {module.name, module.owner_name}:
                 if qualifier:
-                    qualified.setdefault((normalize(qualifier), symbol.normalized_name), []).append(
-                        symbol
-                    )
-        symbols_by_id = {item.id: item for item in symbols}
+                    primary_qualified.setdefault(
+                        (normalize(qualifier), symbol.normalized_name), []
+                    ).append(symbol)
 
+        for symbol in included_symbols:
+            if not symbol.is_export:
+                continue
+            included_exported.setdefault(symbol.normalized_name, []).append(symbol)
+            module = modules_by_id[symbol.module_id]
+            for qualifier in {module.name, module.owner_name}:
+                if qualifier:
+                    included_qualified.setdefault(
+                        (normalize(qualifier), symbol.normalized_name), []
+                    ).append(symbol)
+
+        symbols_by_id = {item.id: item for item in primary_symbols}
         calls = list(
             self.session.scalars(select(CallSite).where(CallSite.project_id == project.id))
         )
@@ -601,12 +681,18 @@ class AnalyzerCore:
                     if len(candidates) == 1:
                         call.resolution = "same_module_object"
                 if not candidates:
-                    candidates = qualified.get((qualifier_root, call.normalized_name), [])
+                    candidates = primary_qualified.get((qualifier_root, call.normalized_name), [])
                     if len(candidates) == 1:
                         call.resolution = "qualified_module"
-                if len(candidates) > 1:
+                if not candidates:
+                    candidates = included_qualified.get((qualifier_root, call.normalized_name), [])
+                    if len(candidates) == 1:
+                        call.resolution = "included_qualified_module"
+                    elif len(candidates) > 1:
+                        call.resolution = "ambiguous_included_qualified"
+                elif len(candidates) > 1:
                     call.resolution = "ambiguous_qualified"
-                elif not candidates:
+                if not candidates:
                     if (
                         qualifier_root in _PLATFORM_QUALIFIERS
                         or qualifier_root in _MANAGER_QUALIFIERS
@@ -625,18 +711,36 @@ class AnalyzerCore:
                 else:
                     common_candidates = [
                         item
-                        for item in exported.get(call.normalized_name, [])
+                        for item in primary_exported.get(call.normalized_name, [])
                         if modules_by_id[item.module_id].owner_kind == "common_module"
                     ]
                     if len(common_candidates) == 1:
                         candidates = common_candidates
                         call.resolution = "global_common_module"
                     else:
-                        candidates = exported.get(call.normalized_name, [])
+                        candidates = primary_exported.get(call.normalized_name, [])
                         if len(candidates) == 1:
                             call.resolution = "unique_export"
                         elif len(candidates) > 1:
                             call.resolution = "ambiguous_export"
+                    if not candidates:
+                        included_common = [
+                            item
+                            for item in included_exported.get(call.normalized_name, [])
+                            if modules_by_id[item.module_id].owner_kind == "common_module"
+                        ]
+                        if len(included_common) == 1:
+                            candidates = included_common
+                            call.resolution = "included_global_common_module"
+                        elif len(included_common) > 1:
+                            candidates = included_common
+                            call.resolution = "ambiguous_included_common_module"
+                        else:
+                            candidates = included_exported.get(call.normalized_name, [])
+                            if len(candidates) == 1:
+                                call.resolution = "included_unique_export"
+                            elif len(candidates) > 1:
+                                call.resolution = "ambiguous_included_export"
             if len(candidates) == 1:
                 target_symbol = candidates[0]
                 call.resolved_symbol_id = target_symbol.id
@@ -660,6 +764,9 @@ class AnalyzerCore:
                     "calls",
                     call.line,
                     True,
+                    {"target_project": target_symbol.project_id}
+                    if target_symbol.project_id != project.id
+                    else None,
                 )
             elif not call.qualifier and call.normalized_name in _BUILTINS:
                 call.resolution = "built_in"
@@ -680,6 +787,9 @@ class AnalyzerCore:
                 if source_module
                 else "<source>"
             )
+            details: dict[str, object] = {"raw": reference.raw_value} if reference.raw_value else {}
+            if target_metadata and target_metadata.project_id != project.id:
+                details["target_project"] = target_metadata.project_id
             self._edge(
                 project.id,
                 reference.source_file_id,
@@ -696,7 +806,7 @@ class AnalyzerCore:
                 reference.relation,
                 reference.line,
                 target_metadata is not None,
-                {"raw": reference.raw_value} if reference.raw_value else None,
+                details or None,
             )
 
         for query in self.session.scalars(
@@ -722,9 +832,12 @@ class AnalyzerCore:
                     f"query_{table['operation']}",
                     query.line_start,
                     target_metadata is not None,
+                    {"target_project": target_metadata.project_id}
+                    if target_metadata and target_metadata.project_id != project.id
+                    else None,
                 )
 
-        for item in metadata:
+        for item in primary_metadata:
             if item.parent_full_name:
                 parent = self._resolve_metadata(item.parent_full_name, aliases)
                 if parent:
@@ -740,6 +853,9 @@ class AnalyzerCore:
                         "contains",
                         None,
                         True,
+                        {"source_project": parent.project_id}
+                        if parent.project_id != project.id
+                        else None,
                     )
         self.session.flush()
 

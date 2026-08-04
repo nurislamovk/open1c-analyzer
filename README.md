@@ -44,6 +44,20 @@ edges without rereading BSL/XML files:
 uv run open1c project resolve TMS
 ```
 
+For an extension, resolve calls and metadata references against the indexed base
+configuration:
+
+```powershell
+uv run open1c project resolve TMS_EXT --include TMS_UNF
+```
+
+The same option is available on incremental analysis, so changed extension files
+can be indexed and linked in one command:
+
+```powershell
+uv run open1c project analyze TMS_EXT --include TMS_UNF
+```
+
 ## Collected knowledge
 
 The analyzer stores:
@@ -103,16 +117,22 @@ The context schema is `open1c-analyzer-context-v1`. It is bounded by source-unit
 and character limits and is intended for a concrete engineering task, unlike the
 full project snapshot.
 
-A separately indexed extension can be included in focused retrieval. Cross-project
-calls are surfaced only when the target method is unique; they are marked as
-`cross_project_candidate` rather than silently persisted as a certain edge.
+A separately indexed extension can be included in focused retrieval. Run
+`project resolve` with the base configuration first to persist conservative
+cross-project links. Extension symbols take precedence; the base configuration is
+used only when the extension has no matching local or qualified export.
 
 ```powershell
-uv run open1c find TMS_UNF "ОбработкаПроведения" --include TMS_EXT
+uv run open1c project resolve TMS_EXT --include TMS_UNF
+uv run open1c find TMS_EXT "ОбработкаПроведения" --include TMS_UNF
 uv run open1c calls TMS_EXT "Запустить" --include TMS_UNF --direction outgoing
-uv run open1c context TMS_UNF "РассчитатьПотребности" --include TMS_EXT `
+uv run open1c context TMS_EXT "Запустить" --include TMS_UNF `
     --output .open1c\tms-context.json
 ```
+
+For databases created before explicit linking, focused retrieval still surfaces a
+unique unresolved target as `cross_project_candidate` until `project resolve --include`
+is run.
 
 The earlier project-scoped inspection commands remain available for compatibility:
 

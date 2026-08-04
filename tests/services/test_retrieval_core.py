@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from open1c_analyzer.services.analyzer import AnalyzerCore
 from open1c_analyzer.services.project_catalog import ProjectCatalog
 from open1c_analyzer.services.retrieval import RetrievalService
-from open1c_analyzer.storage.models import Base, CallSite
+from open1c_analyzer.storage.models import Base, CallSite, Symbol
 
 
 @contextmanager
@@ -298,3 +298,139 @@ def test_context_prioritizes_requested_module_before_graph_neighbors(tmp_path: P
     assert payload["source_units"][0]["symbol"].startswith("Цель.")
     assert "Процедура Старт" in payload["source_units"][0]["source"]
     assert not any("Чужой" in item["caller"] for item in payload["calls"])
+
+
+def test_explicit_cross_project_resolution_and_traversal(tmp_path: Path) -> None:
+    base = tmp_path / "base"
+    extension = tmp_path / "extension"
+    _metadata(
+        base / "CommonModules" / "ПечатьДокументовУНФ.xml", "CommonModule", "ПечатьДокументовУНФ"
+    )
+    base_module = base / "CommonModules" / "ПечатьДокументовУНФ" / "Ext" / "Module.bsl"
+    base_module.parent.mkdir(parents=True)
+    base_module.write_text(
+        "Функция ПолучитьОбластьБезопасно(Макет, ИмяОбласти) Экспорт\n"
+        "    Возврат Неопределено;\n"
+        "КонецФункции",
+        encoding="utf-8",
+    )
+    _metadata(extension / "DataProcessors" / "Печать.xml", "DataProcessor", "Печать")
+    extension_module = extension / "DataProcessors" / "Печать" / "Ext" / "ObjectModule.bsl"
+    extension_module.parent.mkdir(parents=True)
+    extension_module.write_text(
+        "Процедура Сформировать()\n"
+        '    Область = ПечатьДокументовУНФ.ПолучитьОбластьБезопасно(Макет, "Шапка");\n'
+        "КонецПроцедуры",
+        encoding="utf-8",
+    )
+    context_path = tmp_path / "extension-context.json"
+
+    with _session() as session:
+        catalog = ProjectCatalog(session)
+        base_project = catalog.add_project("TMS_UNF", base)
+        catalog.add_project("TMS_EXT", extension)
+        analyzer = AnalyzerCore(session)
+        analyzer.analyze_project("TMS_UNF")
+        analyzer.analyze_project("TMS_EXT")
+        resolution = analyzer.resolve_project("TMS_EXT", include=("TMS_UNF",))
+        call = session.scalar(
+            select(CallSite).where(
+                CallSite.project_id == catalog.get_project("TMS_EXT").id,
+                CallSite.full_name == "ПечатьДокументовУНФ.ПолучитьОбластьБезопасно",
+            )
+        )
+        assert call is not None
+        target = session.get(Symbol, call.resolved_symbol_id)
+        assert target is not None
+
+        service = RetrievalService(session)
+        outgoing = service.calls(
+            "TMS_EXT",
+            "Сформировать",
+            direction="outgoing",
+            include=("TMS_UNF",),
+            depth=1,
+        )
+        incoming = service.calls(
+            "TMS_UNF",
+            "ПечатьДокументовУНФ.ПолучитьОбластьБезопасно",
+            direction="incoming",
+            include=("TMS_EXT",),
+            depth=1,
+        )
+        impact = service.impact(
+            "TMS_UNF",
+            "ПечатьДокументовУНФ.ПолучитьОбластьБезопасно",
+            include=("TMS_EXT",),
+            depth=1,
+        )
+        written = service.context(
+            "TMS_EXT",
+            "Сформировать",
+            context_path,
+            include=("TMS_UNF",),
+            depth=1,
+            max_chars=20_000,
+            max_units=10,
+        )
+
+    assert resolution.unresolved == 0
+    assert call.resolution == "included_qualified_module"
+    assert target.project_id == base_project.id
+    assert any(row.callee_project == "TMS_UNF" for row in outgoing)
+    assert any(row.project == "TMS_EXT" for row in incoming)
+    assert any(row.project == "TMS_EXT" and row.relation == "calls" for row in impact)
+    payload = json.loads(written.read_text(encoding="utf-8"))
+    assert {item["project"] for item in payload["source_units"]} == {"TMS_EXT", "TMS_UNF"}
+    assert any(item["callee_project"] == "TMS_UNF" for item in payload["calls"])
+
+
+def test_cross_project_context_prioritizes_primary_project_callers(tmp_path: Path) -> None:
+    base = tmp_path / "base"
+    extension = tmp_path / "extension"
+    _metadata(base / "CommonModules" / "ОбщийAPI.xml", "CommonModule", "ОбщийAPI")
+    base_module = base / "CommonModules" / "ОбщийAPI" / "Ext" / "Module.bsl"
+    base_module.parent.mkdir(parents=True)
+    base_module.write_text(
+        "Функция ПолучитьДанные() Экспорт\n"
+        "    Возврат 1;\n"
+        "КонецФункции\n\n"
+        "Процедура ТиповойВызывающийМетод() Экспорт\n"
+        "    Данные = ОбщийAPI.ПолучитьДанные();\n"
+        f'    Текст = "{"ОченьДлинныйТиповойКод" * 100}";\n'
+        "КонецПроцедуры",
+        encoding="utf-8",
+    )
+    _metadata(extension / "DataProcessors" / "Дополнение.xml", "DataProcessor", "Дополнение")
+    extension_module = extension / "DataProcessors" / "Дополнение" / "Ext" / "ObjectModule.bsl"
+    extension_module.parent.mkdir(parents=True)
+    extension_module.write_text(
+        "Процедура РасширенныйВызывающийМетод()\n"
+        "    Данные = ОбщийAPI.ПолучитьДанные();\n"
+        "КонецПроцедуры",
+        encoding="utf-8",
+    )
+    context_path = tmp_path / "cross-project-priority.json"
+
+    with _session() as session:
+        catalog = ProjectCatalog(session)
+        catalog.add_project("TMS_UNF", base)
+        catalog.add_project("TMS_EXT", extension)
+        analyzer = AnalyzerCore(session)
+        analyzer.analyze_project("TMS_UNF")
+        analyzer.analyze_project("TMS_EXT")
+        analyzer.resolve_project("TMS_EXT", include=("TMS_UNF",))
+        written = RetrievalService(session).context(
+            "TMS_EXT",
+            "ОбщийAPI.ПолучитьДанные",
+            context_path,
+            include=("TMS_UNF",),
+            depth=1,
+            max_chars=500,
+            max_units=10,
+        )
+
+    payload = json.loads(written.read_text(encoding="utf-8"))
+    assert payload["source_units"][0]["symbol"] == "ОбщийAPI.ПолучитьДанные"
+    assert payload["source_units"][1]["project"] == "TMS_EXT"
+    assert "РасширенныйВызывающийМетод" in payload["source_units"][1]["source"]

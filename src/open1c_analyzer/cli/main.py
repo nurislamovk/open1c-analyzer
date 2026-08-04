@@ -144,9 +144,14 @@ def calls(
             return
         table = Table("Depth", "Project", "Caller", "Callee", "Resolution", "Location")
         for row in rows:
+            project_label = (
+                f"{row.project} → {row.callee_project}"
+                if row.callee_project and row.callee_project != row.project
+                else row.project
+            )
             table.add_row(
                 str(row.depth),
-                row.project,
+                project_label,
                 row.caller,
                 row.callee,
                 row.resolution,
