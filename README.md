@@ -144,6 +144,68 @@ uv run open1c project dependencies TMS РегистрНакопления.Зап
 uv run open1c project queries TMS РегистрНакопления.Запасы
 ```
 
+## LLM Integration Core
+
+Configure an OpenAI API key. The standard OpenAI variable and an Open1C-specific
+alias are both supported:
+
+```powershell
+$env:OPENAI_API_KEY = "sk-..."
+# or: $env:OPEN1C_OPENAI_API_KEY = "sk-..."
+```
+
+Ask a natural-language engineering question. The command ranks indexed entities,
+selects an entry point, builds bounded source-backed context, calls the OpenAI
+Responses API and prints an answer with source locations:
+
+```powershell
+uv run open1c ask TMS_EXT `
+    "Где и как расширение изменяет печатную форму счета на оплату?" `
+    --include TMS_UNF
+```
+
+Use `--term` when the task has an exact technical entry point:
+
+```powershell
+uv run open1c ask TMS_EXT `
+    "Объясни изменение печатной формы и риски обновления типовой УНФ" `
+    --term "Обработка.ПечатьСчетНаОплату" `
+    --include TMS_UNF
+```
+
+The default model is `gpt-5.6` with medium reasoning. Override it with `--model`
+and `--reasoning`, or environment variables `OPEN1C_OPENAI_MODEL` and
+`OPEN1C_OPENAI_REASONING_EFFORT`. API requests are sent with `store=false`.
+
+Every run is reproducible and stored under `.open1c/runs/<timestamp>-<question>/`:
+
+- `request.json` — question, retrieval plan, model settings and SHA-256 hashes;
+- `context.json` — complete Open1C Analyzer context package;
+- `prompt.txt` — exact instructions and bounded prompt sent to the provider;
+- `answer.md` — model answer;
+- `run.json` — status, request/response IDs and token usage.
+
+Prepare and inspect all artifacts without sending source code to OpenAI:
+
+```powershell
+uv run open1c ask TMS_EXT `
+    "Где изменяется печать счета на оплату?" `
+    --include TMS_UNF `
+    --dry-run
+```
+
+When inspecting UTF-8 run artifacts from Windows PowerShell 5.1, specify the
+encoding explicitly to avoid mojibake:
+
+```powershell
+$request = Get-Content ".open1c\runs\<run>\request.json" -Raw -Encoding UTF8 |
+    ConvertFrom-Json
+```
+
+The prompt builder preserves exact matches and selected source units first, then
+trims graph edges and unresolved-call noise to fit `--max-prompt-chars`. Use
+`--max-chars`, `--max-units` and `--max-output-tokens` to control the budget.
+
 ## Full snapshot
 
 A complete snapshot is still available, but it can be very large for a production

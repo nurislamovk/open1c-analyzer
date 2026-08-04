@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "open1c-analyzer"
-version = "0.10.1"
+version = "0.11.0"
 description = "Static analysis and knowledge extraction toolkit for 1C:Enterprise source exports"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -12,6 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "Konstantin Nurislamov" }]
 dependencies = [
   "alembic>=1.13,<2.0",
+  "openai>=2.46,<3.0",
   "pydantic-settings>=2.6,<3.0",
   "rich>=13.9,<15.0",
   "sqlalchemy>=2.0,<3.0",
