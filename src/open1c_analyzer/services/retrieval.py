@@ -51,6 +51,7 @@ class CallTrace:
     file: str
     line: int
     depth: int
+    callee_project: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,29 +149,35 @@ class RetrievalService:
                 frontier = frontiers[traversal_direction]
                 if not frontier or len(result) >= limit:
                     continue
-                next_frontier: set[tuple[int, int]] = set()
-                by_project: dict[int, set[int]] = {}
-                for project_id, symbol_id in frontier:
-                    by_project.setdefault(project_id, set()).add(symbol_id)
-                for project_id, symbol_ids in by_project.items():
-                    rows = self._call_rows(
-                        project_id,
-                        traversal_direction,
-                        symbol_ids,
-                        limit - len(result),
+                rows = self._call_rows(
+                    project_ids,
+                    traversal_direction,
+                    frontier,
+                    limit - len(result),
+                )
+                result.extend(self._call_traces(rows, project_by_id, level))
+                next_ids = {
+                    symbol_id
+                    for row in rows
+                    for symbol_id in (
+                        (row.caller_symbol_id,)
+                        if traversal_direction == "incoming"
+                        else (row.resolved_symbol_id,)
                     )
-                    result.extend(self._call_traces(rows, project_by_id, level))
-                    for row in rows:
-                        next_id = (
-                            row.caller_symbol_id
-                            if traversal_direction == "incoming"
-                            else row.resolved_symbol_id
-                        )
-                        if next_id is not None:
-                            next_frontier.add((project_id, next_id))
-                # Cross-project candidate linking is intentionally conservative: only unresolved
-                # outgoing calls with an exact method name and a unique symbol in the requested
-                # scope are surfaced.
+                    if symbol_id is not None
+                }
+                next_symbols = (
+                    list(
+                        self.session.scalars(select(Symbol).where(Symbol.id.in_(sorted(next_ids))))
+                    )
+                    if next_ids
+                    else []
+                )
+                next_frontier = {(item.project_id, item.id) for item in next_symbols}
+
+                # Keep the conservative fallback for databases resolved before projects were
+                # linked explicitly. Once ``project resolve --include`` is run, these rows are
+                # normal resolved calls and this branch produces nothing.
                 if (
                     traversal_direction == "outgoing"
                     and len(project_ids) > 1
@@ -203,56 +210,65 @@ class RetrievalService:
             raise ProjectCatalogError("Impact depth must be at least 1.")
         projects = self._projects(project_name, include)
         project_by_id = {project.id: project for project in projects}
+        project_ids = tuple(project_by_id)
         seeds = self.find(project_name, term, include=include, limit=50)
         frontier = {(item.project_id, item.kind, item.id) for item in seeds}
         visited = set(frontier)
         result: list[ImpactEdge] = []
+        files_by_project = {project_id: self._files(project_id) for project_id in project_ids}
         for level in range(1, depth + 1):
             if not frontier or len(result) >= limit:
                 break
             next_frontier: set[tuple[int, EntityKind, int]] = set()
-            by_project: dict[int, dict[str, set[int]]] = {}
-            for project_id, kind, entity_id in frontier:
-                by_project.setdefault(project_id, {}).setdefault(kind, set()).add(entity_id)
-            for project_id, by_kind in by_project.items():
-                conditions = [
-                    and_(Dependency.target_kind == kind, Dependency.target_id.in_(sorted(ids)))
-                    for kind, ids in by_kind.items()
-                ]
-                if not conditions:
-                    continue
-                rows = list(
-                    self.session.scalars(
+            by_kind: dict[EntityKind, set[int]] = {}
+            for _project_id, kind, entity_id in frontier:
+                by_kind.setdefault(kind, set()).add(entity_id)
+            rows: list[Dependency] = []
+            for kind, ids in by_kind.items():
+                ordered_ids = sorted(ids)
+                for offset in range(0, len(ordered_ids), 800):
+                    if len(result) + len(rows) >= limit:
+                        break
+                    chunk = ordered_ids[offset : offset + 800]
+                    batch = self.session.scalars(
                         select(Dependency)
-                        .where(Dependency.project_id == project_id, or_(*conditions))
-                        .order_by(Dependency.source_name, Dependency.relation)
-                        .limit(limit - len(result))
+                        .where(
+                            Dependency.project_id.in_(project_ids),
+                            Dependency.target_kind == kind,
+                            Dependency.target_id.in_(chunk),
+                        )
+                        .order_by(
+                            Dependency.project_id,
+                            Dependency.source_name,
+                            Dependency.relation,
+                        )
+                        .limit(limit - len(result) - len(rows))
+                    )
+                    rows.extend(batch)
+            for row in rows:
+                project = project_by_id[row.project_id]
+                files = files_by_project[row.project_id]
+                result.append(
+                    ImpactEdge(
+                        project.name,
+                        row.source_kind,
+                        row.source_name,
+                        row.relation,
+                        row.target_kind,
+                        row.target_name,
+                        row.is_resolved,
+                        files.get(row.source_file_id) if row.source_file_id else None,
+                        row.line,
+                        level,
                     )
                 )
-                files = self._files(project_id)
-                project = project_by_id[project_id]
-                for row in rows:
-                    result.append(
-                        ImpactEdge(
-                            project.name,
-                            row.source_kind,
-                            row.source_name,
-                            row.relation,
-                            row.target_kind,
-                            row.target_name,
-                            row.is_resolved,
-                            files.get(row.source_file_id) if row.source_file_id else None,
-                            row.line,
-                            level,
-                        )
-                    )
-                    if row.source_id is not None and row.source_kind in {
-                        "metadata",
-                        "module",
-                        "symbol",
-                    }:
-                        source_kind = cast(EntityKind, row.source_kind)
-                        next_frontier.add((project_id, source_kind, row.source_id))
+                if row.source_id is not None and row.source_kind in {
+                    "metadata",
+                    "module",
+                    "symbol",
+                }:
+                    source_kind = cast(EntityKind, row.source_kind)
+                    next_frontier.add((row.project_id, source_kind, row.source_id))
             frontier = next_frontier - visited
             visited.update(frontier)
         return result[:limit]
@@ -341,9 +357,13 @@ class RetrievalService:
         )
         seed_symbol_keys = self._seed_symbol_keys(matches, max_units=max_units)
         symbol_keys = set(seed_symbol_keys)
+        project_by_name = {item.name: item for item in projects}
         for trace in call_rows:
-            project = next(item for item in projects if item.name == trace.project)
-            symbol_keys.update(self._symbol_keys_by_names(project.id, (trace.caller, trace.callee)))
+            caller_project = project_by_name[trace.project]
+            symbol_keys.update(self._symbol_keys_by_names(caller_project.id, (trace.caller,)))
+            callee_project = project_by_name.get(trace.callee_project or trace.project)
+            if callee_project is not None:
+                symbol_keys.update(self._symbol_keys_by_names(callee_project.id, (trace.callee,)))
         for edge in impact_rows:
             if edge.source_kind != "symbol":
                 continue
@@ -354,6 +374,7 @@ class RetrievalService:
             symbol_keys,
             max_chars,
             max_units,
+            primary_project_id=projects[0].id,
             priority_keys=seed_symbol_keys,
         )
         selected_symbol_ids: dict[int, set[int]] = {}
@@ -500,6 +521,7 @@ class RetrievalService:
                 row.file,
                 row.line,
                 row.depth,
+                row.callee_project,
             )
             if key in seen:
                 continue
@@ -660,22 +682,53 @@ class RetrievalService:
 
     def _call_rows(
         self,
-        project_id: int,
+        project_ids: tuple[int, ...],
         direction: Literal["incoming", "outgoing"],
-        symbol_ids: set[int],
+        frontier: set[tuple[int, int]],
         limit: int,
     ) -> list[CallSite]:
-        column = (
-            CallSite.resolved_symbol_id if direction == "incoming" else CallSite.caller_symbol_id
-        )
-        return list(
-            self.session.scalars(
-                select(CallSite)
-                .where(CallSite.project_id == project_id, column.in_(sorted(symbol_ids)))
-                .order_by(CallSite.source_file_id, CallSite.line)
-                .limit(limit)
-            )
-        )
+        result: list[CallSite] = []
+        if direction == "outgoing":
+            by_project: dict[int, set[int]] = {}
+            for project_id, symbol_id in frontier:
+                by_project.setdefault(project_id, set()).add(symbol_id)
+            for project_id, symbol_ids in by_project.items():
+                ordered_ids = sorted(symbol_ids)
+                for offset in range(0, len(ordered_ids), 800):
+                    if len(result) >= limit:
+                        break
+                    chunk = ordered_ids[offset : offset + 800]
+                    rows = self.session.scalars(
+                        select(CallSite)
+                        .where(
+                            CallSite.project_id == project_id,
+                            CallSite.caller_symbol_id.in_(chunk),
+                        )
+                        .order_by(CallSite.source_file_id, CallSite.line)
+                        .limit(limit - len(result))
+                    )
+                    result.extend(rows)
+            return result
+
+        target_ids = sorted({symbol_id for _project_id, symbol_id in frontier})
+        for source_project_id in project_ids:
+            if len(result) >= limit:
+                break
+            for offset in range(0, len(target_ids), 800):
+                if len(result) >= limit:
+                    break
+                chunk = target_ids[offset : offset + 800]
+                rows = self.session.scalars(
+                    select(CallSite)
+                    .where(
+                        CallSite.project_id == source_project_id,
+                        CallSite.resolved_symbol_id.in_(chunk),
+                    )
+                    .order_by(CallSite.source_file_id, CallSite.line)
+                    .limit(limit - len(result))
+                )
+                result.extend(rows)
+        return result
 
     def _call_traces(
         self,
@@ -710,6 +763,7 @@ class RetrievalService:
             )
             caller_name = self._symbol_full_name(caller, modules) if caller else "<module>"
             callee_name = self._symbol_full_name(target, modules) if target else row.full_name
+            target_project = projects.get(target.project_id) if target is not None else None
             result.append(
                 CallTrace(
                     projects[row.project_id].name,
@@ -719,6 +773,7 @@ class RetrievalService:
                     files[row.project_id].get(row.source_file_id, "-"),
                     row.line,
                     depth,
+                    target_project.name if target_project is not None else None,
                 )
             )
         return result
@@ -800,6 +855,7 @@ class RetrievalService:
                     files[call.project_id].get(call.source_file_id, "-"),
                     call.line,
                     depth,
+                    projects[target.project_id].name,
                 )
             )
             targets.add((target.project_id, target.id))
@@ -812,6 +868,7 @@ class RetrievalService:
         max_chars: int,
         max_units: int,
         *,
+        primary_project_id: int,
         priority_keys: set[tuple[int, int]] | None = None,
     ) -> list[dict[str, Any]]:
         if not symbol_keys:
@@ -829,6 +886,7 @@ class RetrievalService:
             symbols,
             key=lambda item: (
                 0 if (item.project_id, item.id) in priority else 1,
+                0 if item.project_id == primary_project_id else 1,
                 item.project_id,
                 item.source_file_id,
                 item.line_start,

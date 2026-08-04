@@ -47,3 +47,35 @@ def test_project_add_reports_invalid_directory(database_path: Path, tmp_path: Pa
 
     assert result.exit_code == 1
     assert "does not exist" in result.stdout
+
+
+def test_project_resolve_accepts_included_project(database_path: Path, tmp_path: Path) -> None:
+    base = tmp_path / "base"
+    extension = tmp_path / "extension"
+    base_module = base / "CommonModules" / "API" / "Ext" / "Module.bsl"
+    base_module.parent.mkdir(parents=True)
+    base_module.write_text(
+        "Процедура Выполнить() Экспорт\nКонецПроцедуры",
+        encoding="utf-8",
+    )
+    extension_module = extension / "DataProcessors" / "Расширение" / "Ext" / "ObjectModule.bsl"
+    extension_module.parent.mkdir(parents=True)
+    extension_module.write_text(
+        "Процедура Запустить()\n    API.Выполнить();\nКонецПроцедуры",
+        encoding="utf-8",
+    )
+
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["project", "add", "Base", str(base)]).exit_code == 0
+    assert runner.invoke(app, ["project", "add", "Extension", str(extension)]).exit_code == 0
+    assert runner.invoke(app, ["project", "analyze", "Base"]).exit_code == 0
+    assert runner.invoke(app, ["project", "analyze", "Extension"]).exit_code == 0
+
+    result = runner.invoke(
+        app,
+        ["project", "resolve", "Extension", "--include", "Base"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "resolved 1" in result.stdout
+    assert "unresolved 0" in result.stdout.replace("\n", " ")

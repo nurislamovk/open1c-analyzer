@@ -92,3 +92,26 @@ def test_bsl_analyzer_does_not_treat_language_keywords_as_calls() -> None:
     parsed = BslAnalyzer().parse(text)
 
     assert [item.full_name for item in parsed.calls] == []
+
+
+def test_bsl_analyzer_does_not_treat_extension_annotations_as_calls() -> None:
+    text = """&ИзменениеИКонтроль("Проверить")
+Процедура МКО_Проверить()
+КонецПроцедуры
+
+&Вместо("Записать")
+Процедура МКО_Записать()
+КонецПроцедуры
+
+&Перед("Провести")
+Процедура МКО_ПередПроведением()
+КонецПроцедуры
+
+&После("Провести")
+Процедура МКО_ПослеПроведения()
+КонецПроцедуры
+"""
+
+    parsed = BslAnalyzer().parse(text)
+
+    assert [item.full_name for item in parsed.calls] == []
