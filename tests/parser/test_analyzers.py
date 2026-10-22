@@ -1,5 +1,7 @@
 """Representative BSL, query and metadata extraction tests."""
 
+import pytest
+
 from open1c_analyzer.parser import BslAnalyzer, MetadataParser
 
 
@@ -115,3 +117,133 @@ def test_bsl_analyzer_does_not_treat_extension_annotations_as_calls() -> None:
     parsed = BslAnalyzer().parse(text)
 
     assert [item.full_name for item in parsed.calls] == []
+
+
+def test_metadata_parser_recognizes_nested_managed_form_identity() -> None:
+    text = """<Form xmlns:v8=\"urn:test\"><Events/><ChildItems/></Form>"""
+
+    parsed = MetadataParser().parse(
+        text,
+        "Documents/РасходнаяНакладная/Forms/ФормаСписка/Ext/Form.xml",
+    )
+
+    assert parsed.objects[0].kind == "form"
+    assert parsed.objects[0].name == "ФормаСписка"
+    assert parsed.objects[0].full_name == "Документ.РасходнаяНакладная.Form.ФормаСписка"
+    assert parsed.objects[0].parent_full_name == "Документ.РасходнаяНакладная"
+
+
+def test_bsl_analyzer_extracts_register_write_surfaces() -> None:
+    text = """Процедура Провести()
+    ПроведениеДокументовУНФ.ОтразитьДвижения(
+        "СуммыДокументовРегламентированныйУчет", ТаблицыДляДвижений, Движения, Отказ);
+    Движения.Запасы.Записывать = Истина;
+    Набор = РегистрыСведений.Контроль. СоздатьНаборЗаписей();
+    Набор.Записать();
+КонецПроцедуры
+""".replace(". Создать", ".Создать")
+
+    parsed = BslAnalyzer().parse(text)
+    writes = [item for item in parsed.references if item.relation == "register_write"]
+
+    assert any(item.target_name == "СуммыДокументовРегламентированныйУчет" for item in writes)
+    assert any(item.target_name == "Запасы" for item in writes)
+    assert any(
+        item.target_full_name == "РегистрСведений.Контроль"
+        and item.target_kind == "information_register"
+        for item in writes
+    )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "Количество = Движения.Запасы.Количество();",
+        "Строки = Движения.Запасы.Выгрузить();",
+        "Сообщить(Движения.Запасы.Записывать);",
+        "Движения.Запасы.Записывать = Ложь;",
+        "Если Движения.Запасы.Записывать = Истина Тогда Сообщить(1); КонецЕсли;",
+        "Объект.Движения.Запасы.Добавить();",
+    ],
+)
+def test_movement_reads_and_disabled_writes_are_not_writers(statement: str) -> None:
+    parsed = BslAnalyzer().parse(f"Процедура Проверка()\n{statement}\nКонецПроцедуры")
+    assert not [item for item in parsed.references if item.relation == "register_write"]
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "Движения.Запасы.Добавить();",
+        "Движения.Запасы.Очистить();",
+        "Движения.Запасы.Записать();",
+        "Движения.Запасы.Записывать = Истина;",
+        "Movements.Запасы.Write = True;",
+    ],
+)
+def test_explicit_movement_mutations_remain_writers(statement: str) -> None:
+    parsed = BslAnalyzer().parse(f"Процедура Провести()\n{statement}\nКонецПроцедуры")
+    assert {
+        item.target_name for item in parsed.references if item.relation == "register_write"
+    } == {"Запасы"}
+
+
+@pytest.mark.parametrize(
+    "tail,expected",
+    [
+        ("Набор = РегистрыСведений.B.СоздатьНаборЗаписей(); Набор.Записать();", {"B"}),
+        ("Набор = Неопределено; Набор.Записать();", set()),
+        (
+            "Набор.Записать(); Набор = РегистрыСведений.B.СоздатьНаборЗаписей(); Набор.Записать();",
+            {"A", "B"},
+        ),
+        ("Если\nНабор = Неопределено Тогда Сообщить(1); КонецЕсли; Набор.Записать();", {"A"}),
+        ("Объект.Набор = Неопределено; Набор.Записать();", {"A"}),
+        ("КонецПроцедуры\nПроцедура Другая()\nНабор.Записать();", set()),
+    ],
+)
+def test_record_set_binding_ends_on_reassignment_and_is_procedure_local(
+    tail: str, expected: set[str]
+) -> None:
+    source = (
+        "Процедура Проверка(\nПараметр\n) Экспорт\n"
+        "Набор = РегистрыСведений.A.\nСоздатьНаборЗаписей();\n"
+        f"{tail}\nКонецПроцедуры"
+    )
+    parsed = BslAnalyzer().parse(source)
+    assert {
+        item.target_name for item in parsed.references if item.relation == "register_write"
+    } == expected
+
+
+def test_converted_record_set_is_not_bound_as_a_record_set() -> None:
+    parsed = BslAnalyzer().parse(
+        "Процедура Проверка()\n"
+        "Набор = РегистрыСведений.A.СоздатьНаборЗаписей().Выгрузить();\n"
+        "Набор.Записать();\nКонецПроцедуры"
+    )
+    assert not [item for item in parsed.references if item.relation == "register_write"]
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ("Движения.Запасы.Записывать = Истина;", {"Запасы"}),
+        ("Набор = РегистрыСведений.A.СоздатьНаборЗаписей(); Набор.Записать();", {"A"}),
+        (
+            "Набор = РегистрыСведений.A.СоздатьНаборЗаписей();\n"
+            "#Область Другая\nНабор = РегистрыСведений.B.СоздатьНаборЗаписей();\n"
+            "#КонецОбласти\nНабор.Записать();",
+            {"B"},
+        ),
+    ],
+)
+def test_register_assignment_boundaries_preserve_preprocessor_directives(
+    body: str, expected: set[str]
+) -> None:
+    parsed = BslAnalyzer().parse(
+        f"Процедура Проверка()\n#Область Запись\n{body}\n#КонецОбласти\nКонецПроцедуры"
+    )
+    assert {
+        item.target_name for item in parsed.references if item.relation == "register_write"
+    } == expected

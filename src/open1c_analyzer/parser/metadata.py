@@ -71,6 +71,18 @@ class MetadataParser:
     def parse(self, text: str, relative_path: str) -> MetadataDocument:
         root = ET.fromstring(text)
         main = self._main(root)
+        nested_form = self._nested_form_identity(relative_path)
+        if nested_form is not None:
+            owner_kind, owner_name, form_name = nested_form
+            owner_full_name = full_metadata_name(owner_kind, owner_name)
+            full_name = f"{owner_full_name}.Form.{form_name}"
+            objects = [self._item(main, "form", form_name, full_name, owner_full_name)]
+            return MetadataDocument(
+                tuple(objects),
+                tuple(self._references(main, full_name)),
+                self._profile(main),
+            )
+
         fallback_kind, fallback_name = self._path_identity(relative_path)
         main_tag = local_name(main.tag)
         kind = XML_KIND_MAP.get(main_tag)
@@ -95,6 +107,21 @@ class MetadataParser:
             objects.append(self._item(element, child_kind, child_name, child_full, full_name))
             references.extend(self._references(element, child_full))
         return MetadataDocument(tuple(objects), tuple(references), self._profile(main))
+
+    @staticmethod
+    def _nested_form_identity(relative_path: str) -> tuple[str, str, str] | None:
+        path = PurePosixPath(relative_path.replace("\\", "/"))
+        parts = list(path.parts)
+        if path.name.casefold() != "form.xml" or "Forms" not in parts:
+            return None
+        forms_index = parts.index("Forms")
+        if forms_index <= 1 or forms_index + 1 >= len(parts):
+            return None
+        form_name = parts[forms_index + 1]
+        for index, part in enumerate(parts[:forms_index]):
+            if part in DIRECTORY_KIND_MAP and index + 1 < forms_index:
+                return DIRECTORY_KIND_MAP[part], parts[index + 1], form_name
+        return None
 
     @staticmethod
     def _main(root: ET.Element) -> ET.Element:

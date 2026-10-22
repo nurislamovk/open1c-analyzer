@@ -5,13 +5,14 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from open1c_analyzer.services.analyzer import AnalyzerCore
 from open1c_analyzer.services.project_catalog import ProjectCatalog
 from open1c_analyzer.services.retrieval import RetrievalService
-from open1c_analyzer.storage.models import Base, CallSite, Symbol
+from open1c_analyzer.storage.models import Base, CallSite, Module, Reference, Symbol
 
 
 @contextmanager
@@ -434,3 +435,171 @@ def test_cross_project_context_prioritizes_primary_project_callers(tmp_path: Pat
     assert payload["source_units"][0]["symbol"] == "ОбщийAPI.ПолучитьДанные"
     assert payload["source_units"][1]["project"] == "TMS_EXT"
     assert "РасширенныйВызывающийМетод" in payload["source_units"][1]["source"]
+
+
+def test_register_writer_dependencies_expand_to_calculation_and_data_flow(tmp_path: Path) -> None:
+    source = tmp_path / "configuration"
+    _metadata(
+        source / "InformationRegisters" / "СуммыДокументовРегламентированныйУчет.xml",
+        "InformationRegister",
+        "СуммыДокументовРегламентированныйУчет",
+    )
+    _metadata(
+        source / "CommonModules" / "РасчетыПроведениеДокументов.xml",
+        "CommonModule",
+        "РасчетыПроведениеДокументов",
+    )
+    _metadata(source / "Documents" / "РасходнаяНакладная.xml", "Document", "РасходнаяНакладная")
+
+    common = source / "CommonModules" / "РасчетыПроведениеДокументов" / "Ext" / "Module.bsl"
+    common.parent.mkdir(parents=True)
+    common.write_text(
+        "Процедура СформироватьТаблицаСуммыДокументовРегламентированныйУчет() Экспорт\n"
+        "    СтрокаДвижения.Всего = СтрокаСуммВНацВалюте.СуммаРег;\n"
+        "    СтрокаДвижения.НДС = СтрокаСуммВНацВалюте.СуммаНДСРег;\n"
+        "КонецПроцедуры",
+        encoding="utf-8",
+    )
+    document = source / "Documents" / "РасходнаяНакладная" / "Ext" / "ObjectModule.bsl"
+    document.parent.mkdir(parents=True)
+    document.write_text(
+        "Процедура ОбработкаПроведения(Отказ)\n"
+        "    РасчетыПроведениеДокументов."
+        "СформироватьТаблицаСуммыДокументовРегламентированныйУчет();\n"
+        "    ПроведениеДокументовУНФ.ОтразитьДвижения("
+        '"СуммыДокументовРегламентированныйУчет", ТаблицыДляДвижений, Движения, Отказ);\n'
+        "КонецПроцедуры",
+        encoding="utf-8",
+    )
+
+    with _session() as session:
+        ProjectCatalog(session).add_project("Demo", source)
+        analysis = AnalyzerCore(session).analyze_project("Demo")
+        payload = RetrievalService(session).build_context(
+            "Demo",
+            "РегистрСведений.СуммыДокументовРегламентированныйУчет",
+            depth=3,
+            max_chars=30_000,
+            max_units=20,
+        )
+
+    assert analysis.errors == ()
+    assert any(item["relation"] == "register_write" for item in payload["writes"])
+    assert any(
+        "ОбработкаПроведения" in item["symbol"]
+        for item in payload["source_units"]
+        if item.get("unit_kind") == "symbol"
+    )
+    assert any(
+        "СформироватьТаблицаСуммыДокументовРегламентированныйУчет" in item["symbol"]
+        for item in payload["source_units"]
+        if item.get("unit_kind") == "symbol"
+    )
+    assert any(
+        item["target"] == "СтрокаДвижения.Всего"
+        and "СтрокаСуммВНацВалюте.СуммаРег" in item["expression"]
+        for item in payload["data_flow"]
+    )
+
+
+@pytest.mark.parametrize("extension_manager", [False, True])
+def test_document_manager_calls_require_exact_document_export(
+    tmp_path: Path, extension_manager: bool
+) -> None:
+    base, extension = tmp_path / "base", tmp_path / "extension"
+    for source in (base, extension):
+        _metadata(source / "Documents" / "Накладная.xml", "Document", "Накладная")
+    manager = base / "Documents" / "Накладная" / "Ext" / "ManagerModule.bsl"
+    manager.parent.mkdir(parents=True)
+    manager.write_text(
+        "Процедура Расчет() Экспорт\nКонецПроцедуры\nПроцедура Закрытая()\nКонецПроцедуры",
+        encoding="utf-8",
+    )
+    caller = extension / "Documents" / "Накладная" / "Ext" / "ObjectModule.bsl"
+    caller.parent.mkdir(parents=True)
+    caller.write_text(
+        "Процедура Проверка()\n"
+        "Документы.Накладная.Расчет();\n"
+        "Documents.Накладная.Расчет();\n"
+        "Документы.ДругойДокумент.Расчет();\n"
+        "Документы.Накладная.Закрытая();\n"
+        "Документы.Накладная.ТолькоОбъект();\n"
+        "Документы.Накладная.СоздатьДокумент();\n"
+        "КонецПроцедуры\n"
+        "Процедура Расчет() Экспорт\nКонецПроцедуры\n"
+        "Процедура ТолькоОбъект() Экспорт\nКонецПроцедуры",
+        encoding="utf-8",
+    )
+    if extension_manager:
+        caller.with_name("ManagerModule.bsl").write_text(
+            manager.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    with _session() as session:
+        catalog = ProjectCatalog(session)
+        primary = catalog.add_project("Extension", extension)
+        included = catalog.add_project("Base", base)
+        analyzer = AnalyzerCore(session)
+        analyzer.analyze_project("Base")
+        analyzer.analyze_project("Extension", include=("Base",))
+        calls = list(
+            session.scalars(
+                select(CallSite).where(CallSite.project_id == primary.id).order_by(CallSite.line)
+            )
+        )
+        for call in calls[:2]:
+            target = session.get(Symbol, call.resolved_symbol_id)
+            assert target is not None
+            target_module = session.get(Module, target.module_id)
+            assert target_module is not None
+            assert target_module.module_kind == "manager_module"
+            assert target_module.owner_kind == "document"
+            assert target_module.owner_name == "Накладная"
+            assert target.is_export
+            assert target.project_id == (primary.id if extension_manager else included.id)
+            assert call.resolution == (
+                "document_manager" if extension_manager else "included_document_manager"
+            )
+        assert all(call.resolved_symbol_id is None for call in calls[2:])
+        assert calls[-1].resolution == "platform_api"
+
+
+def test_analysis_schema_upgrade_removes_stale_register_writer_facts(tmp_path: Path) -> None:
+    source = tmp_path / "configuration"
+    _metadata(source / "Documents" / "Проверка.xml", "Document", "Проверка")
+    _metadata(source / "InformationRegisters" / "Контроль.xml", "InformationRegister", "Контроль")
+    module = source / "Documents" / "Проверка" / "Ext" / "ObjectModule.bsl"
+    module.parent.mkdir(parents=True)
+    module.write_text(
+        "Процедура Прочитать()\nКоличество = Движения.Контроль.Количество();\nКонецПроцедуры",
+        encoding="utf-8",
+    )
+    with _session() as session:
+        project = ProjectCatalog(session).add_project("Demo", source)
+        analyzer = AnalyzerCore(session)
+        analyzer.analyze_project("Demo")
+        symbol = session.scalars(select(Symbol).where(Symbol.project_id == project.id)).one()
+        # Simulate the cached false writer produced by schema 2, with unchanged files.
+        project.profile_json = json.dumps({"Open1CAnalysisSchemaVersion": "2"})
+        session.add(
+            Reference(
+                project_id=project.id,
+                source_file_id=symbol.source_file_id,
+                symbol_id=symbol.id,
+                target_kind="register",
+                target_name="Контроль",
+                target_full_name="Контроль",
+                normalized_target="контроль",
+                relation="register_write",
+                line=2,
+            )
+        )
+        session.flush()
+        analyzer.resolve_project("Demo")
+        retrieval = RetrievalService(session)
+        assert retrieval.build_context("Demo", "РегистрСведений.Контроль")["writes"]
+        upgraded = analyzer.analyze_project("Demo")
+        assert upgraded.errors == ()
+        assert upgraded.analyzed_files == 3
+        assert upgraded.graph_rebuilt
+        assert not retrieval.build_context("Demo", "РегистрСведений.Контроль")["writes"]
+        assert analyzer.analyze_project("Demo").analyzed_files == 0

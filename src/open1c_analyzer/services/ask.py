@@ -202,16 +202,20 @@ class QuestionPlanner:
         "анализ",
         "вызов",
         "вызывает",
+        "добавить",
         "где",
         "изменяет",
         "использует",
         "как",
+        "колонка",
         "меняет",
         "обрабатывает",
         "переопределяет",
         "реализован",
         "реализована",
         "реализовано",
+        "список",
+        "форма",
         "формирует",
     }
     _extension_directives: ClassVar[tuple[str, ...]] = (
@@ -328,6 +332,7 @@ class QuestionPlanner:
                         search_term,
                         prefer_code=prefer_code,
                     )
+                    score += self._intent_bonus(item, question)
                     previous = ranked.get(key)
                     if previous is None or score > previous[0]:
                         ranked[key] = (score, matched, item)
@@ -363,6 +368,7 @@ class QuestionPlanner:
                     "",
                     prefer_code=True,
                 )
+                score += self._intent_bonus(item, question)
                 previous = ranked.get(key)
                 if previous is None or score > previous[0]:
                     ranked[key] = (score, matched, item)
@@ -385,6 +391,31 @@ class QuestionPlanner:
                 "No indexed 1C entities matched the question. Use --term with an exact "
                 "object, module or method name."
             )
+        if self._form_list_intent(question):
+            form_matches = [
+                item
+                for item in planned_matches
+                if item.entity.kind == "metadata"
+                and "kind=form" in item.entity.details
+                and "формаспис" in normalize(item.entity.name)
+            ]
+            if form_matches:
+                selected_match = form_matches[0]
+                planned_matches.remove(selected_match)
+                planned_matches.insert(0, selected_match)
+        elif self._register_focus_intent(question):
+            normalized_question = normalize(question)
+            register_matches = [
+                item
+                for item in planned_matches
+                if item.entity.kind == "metadata"
+                and "register" in item.entity.details
+                and normalize(item.entity.name.rsplit(".", 1)[-1]) in normalized_question
+            ]
+            if register_matches:
+                selected_match = register_matches[0]
+                planned_matches.remove(selected_match)
+                planned_matches.insert(0, selected_match)
         selected = planned_matches[0].entity.name
         return AskPlan(question, terms, selected, tuple(planned_matches[:limit]))
 
@@ -393,7 +424,9 @@ class QuestionPlanner:
         explicit.extend(
             value.strip() for value in self._quoted_re.findall(question) if value.strip()
         )
-        words = [word.lower() for word in self._word_re.findall(question)]
+        raw_words = self._word_re.findall(question)
+        identifiers = [word for word in raw_words if self._looks_like_1c_identifier(word)]
+        words = [word.lower() for word in raw_words]
         significant = [
             word
             for word in words
@@ -409,6 +442,7 @@ class QuestionPlanner:
                 phrases.append(phrase)
         ordered = [
             *explicit,
+            *identifiers,
             *significant,
             *sorted(roots, key=lambda item: (-len(item), item)),
             *phrases,
@@ -439,7 +473,8 @@ class QuestionPlanner:
             score += 80
         normalized_search = normalize(searched_term)
         normalized_name = normalize(item.name)
-        if normalized_search and normalized_search == normalized_name:
+        normalized_leaf = normalize(item.name.rsplit(".", 1)[-1])
+        if normalized_search and normalized_search in {normalized_name, normalized_leaf}:
             score += 150
         elif normalized_search and normalized_search in normalized_name:
             score += 35
@@ -477,6 +512,108 @@ class QuestionPlanner:
                 "модул",
                 "процедур",
                 "функц",
+            )
+        )
+
+    @staticmethod
+    def _intent_bonus(item: EntityRef, question: str) -> int:
+        normalized_question = normalize(question)
+        haystack = normalize(f"{item.name} {item.details}")
+        form_list_intent = QuestionPlanner._form_list_intent(question)
+        bonus = 0
+        if form_list_intent:
+            list_form = "формаспис" in haystack or "formформаспис" in haystack
+            if item.kind == "metadata" and "kind=form" in item.details and list_form:
+                bonus += 320
+            elif item.kind == "module" and list_form:
+                bonus += 190
+            elif item.kind == "symbol" and list_form:
+                bonus += 100
+            elif "manager_module" in haystack or "object_module" in haystack:
+                bonus -= 100
+        writer_intent = any(
+            marker in normalized_question
+            for marker in (
+                "какформир",
+                "гдеформир",
+                "какзапис",
+                "гдезапис",
+                "ктопишет",
+                "движен",
+                "проведен",
+            )
+        )
+        if writer_intent:
+            if item.kind == "metadata" and "register" in item.details:
+                bonus += 90
+            if item.kind == "symbol" and any(
+                marker in haystack for marker in ("сформир", "движен", "проведен", "запис")
+            ):
+                bonus += 45
+        return bonus
+
+    @staticmethod
+    def _form_list_intent(question: str) -> bool:
+        normalized_question = normalize(question)
+        words = {normalize(word) for word in QuestionPlanner._word_re.findall(question)}
+        has_form = bool(
+            words
+            & {
+                "форма",
+                "формы",
+                "форме",
+                "форму",
+                "формой",
+                "формою",
+                "форм",
+                "формам",
+                "формами",
+                "формах",
+            }
+        )
+        has_list = any(word.startswith("спис") for word in words)
+        if has_form and has_list:
+            return True
+        return any(
+            marker in normalized_question
+            for marker in (
+                "формаспис",
+                "формуспис",
+                "списокдокумент",
+                "динамическспис",
+                "колонкспис",
+                "полеспис",
+            )
+        )
+
+    @staticmethod
+    def _looks_like_1c_identifier(word: str) -> bool:
+        """Keep CamelCase/underscore 1C names with their original Unicode case."""
+        if "_" in word and len(word) >= 4:
+            return True
+        if not word or word.islower() or word.isupper():
+            return False
+        uppercase_after_first = any(char.isupper() for char in word[1:])
+        return uppercase_after_first and any(char.islower() for char in word)
+
+    @staticmethod
+    def _register_focus_intent(question: str) -> bool:
+        normalized_question = normalize(question)
+        has_register = "регистр" in normalized_question or "register" in normalized_question
+        if not has_register:
+            return False
+        return any(
+            marker in normalized_question
+            for marker in (
+                "какформир",
+                "гдеформир",
+                "какзапис",
+                "гдезапис",
+                "ктопишет",
+                "записьрегистр",
+                "движен",
+                "проведен",
+                "ресурс",
             )
         )
 
@@ -545,6 +682,8 @@ class AskService:
             context_payload = self.retrieval.build_context(
                 project_name,
                 plan.selected_term,
+                question=question,
+                search_terms=plan.search_terms,
                 include=include,
                 depth=depth,
                 max_chars=max_chars,
@@ -677,6 +816,8 @@ class AskService:
             "source_units": payload["source_units"],
             "calls": payload["calls"],
             "impact": payload["impact"],
+            "writes": payload.get("writes", []),
+            "data_flow": payload.get("data_flow", []),
             "queries": payload["queries"],
             "unresolved_near_context": payload["unresolved_near_context"],
         }
@@ -687,6 +828,7 @@ class AskService:
         # Preserve source code and exact matches. Trim graph/noise lists progressively.
         for key, minimum in (
             ("unresolved_near_context", 20),
+            ("data_flow", 40),
             ("impact", 60),
             ("calls", 80),
             ("queries", 10),

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
 
 from open1c_analyzer.parser.io import read_text
@@ -288,6 +289,12 @@ class RetrievalService:
                             Dependency.target_id.in_(chunk),
                         )
                         .order_by(
+                            case(
+                                (Dependency.relation == "register_write", 0),
+                                (Dependency.relation == "query_write", 1),
+                                (Dependency.relation == "calls", 2),
+                                else_=3,
+                            ),
                             Dependency.project_id,
                             Dependency.source_name,
                             Dependency.relation,
@@ -385,6 +392,8 @@ class RetrievalService:
         depth: int = 1,
         max_chars: int = 60_000,
         max_units: int = 30,
+        question: str = "",
+        search_terms: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         """Build a bounded context payload without writing it to disk."""
         projects = self._projects(project_name, include)
@@ -405,8 +414,25 @@ class RetrievalService:
             include=include,
             limit=300,
         )
+        writer_symbol_keys = self._writer_symbol_keys(matches, tuple(project_by_id))
+        preferred_writers = self._document_writer_keys(writer_symbol_keys, question, search_terms)
+        preferred_graph_keys, preferred_graph_edges = self._symbol_dependency_neighborhood(
+            preferred_writers,
+            project_by_id,
+            depth=depth,
+            limit=220,
+            search_terms=search_terms,
+        )
+        writer_graph_keys, writer_graph_edges = self._symbol_dependency_neighborhood(
+            writer_symbol_keys,
+            project_by_id,
+            depth=depth,
+            limit=220,
+        )
         seed_symbol_keys = self._seed_symbol_keys(matches, max_units=max_units)
-        symbol_keys = set(seed_symbol_keys)
+        symbol_keys = (
+            set(seed_symbol_keys) | writer_symbol_keys | writer_graph_keys | preferred_graph_keys
+        )
         project_by_name = {item.name: item for item in projects}
         for trace in call_rows:
             caller_project = project_by_name[trace.project]
@@ -419,16 +445,32 @@ class RetrievalService:
                 continue
             project = next(item for item in projects if item.name == edge.project)
             symbol_keys.update(self._symbol_keys_by_names(project.id, (edge.source,)))
-        source_units = self._source_units(
+        form_budget = min(30_000, max(0, max_chars // 3))
+        form_units = self._metadata_source_units(
+            matches,
             project_by_id,
-            symbol_keys,
-            max_chars,
-            max_units,
-            primary_project_id=projects[0].id,
-            priority_keys=seed_symbol_keys,
+            max_chars=form_budget,
+            max_units=min(2, max_units),
         )
+        form_chars = sum(len(str(item["source"])) for item in form_units)
+        source_units = [
+            *form_units,
+            *self._source_units(
+                project_by_id,
+                symbol_keys,
+                max(0, max_chars - form_chars),
+                max(0, max_units - len(form_units)),
+                primary_project_id=projects[0].id,
+                priority_keys=seed_symbol_keys | writer_symbol_keys,
+                preferred_writers=preferred_writers,
+                preferred_graph=preferred_graph_keys,
+                search_terms=search_terms,
+            ),
+        ]
         selected_symbol_ids: dict[int, set[int]] = {}
         for unit in source_units:
+            if unit.get("unit_kind") == "metadata":
+                continue
             selected_symbol_ids.setdefault(int(unit["project_id"]), set()).add(
                 int(unit["symbol_id"])
             )
@@ -438,9 +480,17 @@ class RetrievalService:
             project_by_id,
             limit=max(0, 300 - len(impact_rows)),
         )
-        impact_rows = self._deduplicate_impact([*impact_rows, *context_outgoing])[:300]
+        impact_rows = self._deduplicate_impact(
+            [*preferred_graph_edges, *impact_rows, *writer_graph_edges, *context_outgoing]
+        )[:300]
         queries = self._queries(selected_symbol_ids, project_by_id)
         unresolved = self._unresolved_near(selected_symbol_ids, project_by_id)
+        writes = [
+            asdict(item)
+            for item in impact_rows
+            if item.relation in {"register_write", "query_write"}
+        ]
+        data_flow = self._assignment_hints(source_units)
         return {
             "schema": "open1c-analyzer-context-v1",
             "generated_at": datetime.now(UTC).isoformat(),
@@ -450,6 +500,7 @@ class RetrievalService:
                 "term": term,
                 "depth": depth,
                 "max_chars": max_chars,
+                "search_terms": list(search_terms),
             },
             "projects": [
                 {
@@ -466,6 +517,8 @@ class RetrievalService:
             "source_units": source_units,
             "calls": [asdict(item) for item in call_rows],
             "impact": [asdict(item) for item in impact_rows],
+            "writes": writes,
+            "data_flow": data_flow,
             "queries": queries,
             "unresolved_near_context": unresolved,
             "limits": {
@@ -556,6 +609,374 @@ class RetrievalService:
                         1,
                     )
                 )
+        return result
+
+    def _document_writer_keys(
+        self,
+        writers: set[tuple[int, int]],
+        question: str,
+        search_terms: tuple[str, ...],
+    ) -> set[tuple[int, int]]:
+        """Prefer writers owned by a document explicitly named in the question."""
+        words = {
+            normalize(word)
+            for text in (question, *search_terms)
+            for word in re.findall(r"[\w]+", text)
+        }
+        if not writers or not words:
+            return set()
+        rows = self.session.execute(
+            select(Symbol, Module)
+            .join(Module, Module.id == Symbol.module_id)
+            .where(Symbol.id.in_(sorted(symbol_id for _, symbol_id in writers)))
+        )
+        return {
+            (symbol.project_id, symbol.id)
+            for symbol, module in rows
+            if module.owner_kind == "document" and normalize(module.owner_name or "") in words
+        }
+
+    def _writer_symbol_keys(
+        self,
+        matches: list[EntityRef],
+        project_ids: tuple[int, ...],
+    ) -> set[tuple[int, int]]:
+        """Return symbols that write matched metadata objects."""
+        metadata_ids = {item.id for item in matches if item.kind == "metadata"}
+        if not metadata_ids:
+            return set()
+        result: set[tuple[int, int]] = set()
+        rows = self.session.execute(
+            select(Dependency.project_id, Dependency.source_id).where(
+                Dependency.project_id.in_(project_ids),
+                Dependency.target_kind == "metadata",
+                Dependency.target_id.in_(sorted(metadata_ids)),
+                Dependency.source_kind == "symbol",
+                Dependency.source_id.is_not(None),
+                Dependency.relation.in_(("register_write", "query_write")),
+            )
+        )
+        result.update(
+            (int(row_project_id), int(source_id))
+            for row_project_id, source_id in rows
+            if source_id is not None
+        )
+        return result
+
+    def _symbol_dependency_neighborhood(
+        self,
+        seeds: set[tuple[int, int]],
+        projects: dict[int, Project],
+        *,
+        depth: int,
+        limit: int,
+        search_terms: tuple[str, ...] = (),
+    ) -> tuple[set[tuple[int, int]], list[ImpactEdge]]:
+        """Expand call dependencies around writer symbols without losing graph direction."""
+        if not seeds or depth < 1 or limit < 1:
+            return set(), []
+        project_ids = tuple(projects)
+        frontier = set(seeds)
+        visited = set(seeds)
+        found: set[tuple[int, int]] = set()
+        edges: list[ImpactEdge] = []
+        files_by_project = {project_id: self._files(project_id) for project_id in project_ids}
+        terms = {normalize(term) for term in search_terms if len(normalize(term)) >= 4}
+
+        for level in range(1, depth + 1):
+            if not frontier or len(edges) >= limit:
+                break
+            frontier_ids = sorted({symbol_id for _project_id, symbol_id in frontier})
+            outgoing = list(
+                self.session.scalars(
+                    select(Dependency)
+                    .where(
+                        Dependency.project_id.in_(project_ids),
+                        Dependency.source_kind == "symbol",
+                        Dependency.source_id.in_(frontier_ids),
+                        Dependency.target_kind == "symbol",
+                        Dependency.target_id.is_not(None),
+                        Dependency.relation == "calls",
+                    )
+                    .order_by(Dependency.project_id, Dependency.source_name, Dependency.line)
+                    .limit((limit - len(edges)) * (5 if terms else 1))
+                )
+            )
+            if terms:
+                # Reserve room for deeper calculations instead of spending the whole
+                # graph budget on a wide posting handler or repeated movement calls.
+                unique_outgoing = {
+                    (row.source_id, row.target_id): row for row in reversed(outgoing)
+                }
+                level_budget = max(1, (limit - len(edges)) // (depth - level + 1))
+                outgoing = sorted(
+                    unique_outgoing.values(),
+                    key=lambda row: (
+                        -sum(
+                            min(len(term), 32)
+                            for term in terms
+                            if term in normalize(row.target_name)
+                        ),
+                        row.project_id,
+                        row.source_name,
+                        row.line or 0,
+                    ),
+                )[:level_budget]
+            remaining = max(0, limit - len(edges) - len(outgoing))
+            incoming = (
+                list(
+                    self.session.scalars(
+                        select(Dependency)
+                        .where(
+                            Dependency.project_id.in_(project_ids),
+                            Dependency.source_kind == "symbol",
+                            Dependency.source_id.is_not(None),
+                            Dependency.target_kind == "symbol",
+                            Dependency.target_id.in_(frontier_ids),
+                            Dependency.relation == "calls",
+                        )
+                        .order_by(Dependency.project_id, Dependency.source_name, Dependency.line)
+                        .limit(remaining)
+                    )
+                )
+                if remaining and level == 1 and not terms
+                else []
+            )
+            rows = [*outgoing, *incoming]
+            next_symbol_ids = {
+                int(value)
+                for row in rows
+                for value in (row.source_id, row.target_id)
+                if value is not None
+            }
+            symbols = {
+                item.id: item
+                for item in self.session.scalars(
+                    select(Symbol).where(Symbol.id.in_(sorted(next_symbol_ids)))
+                )
+            }
+            next_frontier: set[tuple[int, int]] = set()
+            for row in rows:
+                project = projects[row.project_id]
+                edges.append(
+                    ImpactEdge(
+                        project.name,
+                        row.source_kind,
+                        row.source_name,
+                        row.relation,
+                        row.target_kind,
+                        row.target_name,
+                        row.is_resolved,
+                        files_by_project[row.project_id].get(row.source_file_id)
+                        if row.source_file_id
+                        else None,
+                        row.line,
+                        level,
+                    )
+                )
+                for symbol_id in (row.source_id, row.target_id):
+                    if symbol_id is None:
+                        continue
+                    symbol = symbols.get(symbol_id)
+                    if symbol is None or symbol.project_id not in projects:
+                        continue
+                    key = (symbol.project_id, symbol.id)
+                    found.add(key)
+                    if key not in visited:
+                        next_frontier.add(key)
+            visited.update(next_frontier)
+            frontier = next_frontier
+        return found, self._deduplicate_impact(edges)[:limit]
+
+    def _metadata_source_units(
+        self,
+        matches: list[EntityRef],
+        projects: dict[int, Project],
+        *,
+        max_chars: int,
+        max_units: int,
+    ) -> list[dict[str, Any]]:
+        """Include focused source excerpts for first-class managed forms."""
+        if max_chars <= 0 or max_units <= 0:
+            return []
+        form_ids = [item.id for item in matches if item.kind == "metadata"]
+        if not form_ids:
+            return []
+        rows = list(
+            self.session.scalars(
+                select(MetadataObject)
+                .where(MetadataObject.id.in_(form_ids), MetadataObject.kind == "form")
+                .order_by(MetadataObject.full_name)
+            )
+        )
+        project_rank = {project_id: index for index, project_id in enumerate(projects)}
+        rows.sort(key=lambda item: (project_rank.get(item.project_id, 999), item.full_name))
+        files_by_project = {project_id: self._source_files(project_id) for project_id in projects}
+        result: list[dict[str, Any]] = []
+        used = 0
+        for item in rows:
+            if len(result) >= max_units or used >= max_chars:
+                break
+            project = projects.get(item.project_id)
+            if project is None or not project.source_path:
+                continue
+            source_file = files_by_project[item.project_id].get(item.source_file_id)
+            if source_file is None:
+                continue
+            source_path = Path(project.source_path).joinpath(
+                *PurePosixPath(source_file.relative_path).parts
+            )
+            try:
+                text = read_text(source_path)
+            except OSError:
+                continue
+            source, start, end = self._form_excerpt(text, max_chars - used)
+            if not source:
+                continue
+            result.append(
+                {
+                    "unit_kind": "metadata",
+                    "project": project.name,
+                    "project_id": project.id,
+                    "metadata_id": item.id,
+                    "symbol": item.full_name,
+                    "kind": item.kind,
+                    "file": source_file.relative_path,
+                    "line_start": start,
+                    "line_end": end,
+                    "source": source,
+                }
+            )
+            used += len(source)
+        return result
+
+    @staticmethod
+    def _form_excerpt(text: str, budget: int) -> tuple[str, int, int]:
+        if budget <= 0:
+            return "", 1, 1
+        lines = text.splitlines()
+        if not lines:
+            return "", 1, 1
+        ranges: list[tuple[int, int]] = []
+
+        def add_window(index: int, before: int, after: int) -> None:
+            ranges.append((max(0, index - before), min(len(lines) - 1, index + after)))
+
+        for index, line in enumerate(lines[:250]):
+            if "<Events>" in line:
+                add_window(index, 3, 30)
+                break
+        table_index = next(
+            (index for index, line in enumerate(lines) if '<Table name="Список"' in line),
+            None,
+        )
+        if table_index is not None:
+            add_window(table_index, 4, 150)
+        attribute_index = next(
+            (index for index, line in enumerate(lines) if '<Attribute name="Список"' in line),
+            None,
+        )
+        if attribute_index is not None:
+            add_window(attribute_index, 2, 18)
+            query_index = next(
+                (
+                    index
+                    for index in range(attribute_index, len(lines))
+                    if "<QueryText>" in lines[index]
+                ),
+                None,
+            )
+            if query_index is not None:
+                query_end = next(
+                    (
+                        index
+                        for index in range(query_index, len(lines))
+                        if "</QueryText>" in lines[index]
+                    ),
+                    min(len(lines) - 1, query_index + 260),
+                )
+                ranges.append((query_index, min(query_end, query_index + 260)))
+            main_table = next(
+                (
+                    index
+                    for index in range(attribute_index, len(lines))
+                    if "<MainTable>" in lines[index]
+                ),
+                None,
+            )
+            if main_table is not None:
+                add_window(main_table, 5, 12)
+        if not ranges:
+            ranges.append((0, min(len(lines) - 1, 180)))
+
+        merged: list[tuple[int, int]] = []
+        for start, end in sorted(ranges):
+            if merged and start <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        chunks: list[str] = []
+        used = 0
+        actual_start = merged[0][0] + 1
+        actual_end = actual_start
+        for start, end in merged:
+            chunk = f"[LINES {start + 1}-{end + 1}]\n" + "\n".join(lines[start : end + 1])
+            remaining = budget - used
+            if remaining <= 0:
+                break
+            if len(chunk) > remaining:
+                chunk = chunk[:remaining]
+            chunks.append(chunk)
+            used += len(chunk)
+            actual_end = end + 1
+            if used >= budget:
+                break
+        return "\n\n".join(chunks), actual_start, actual_end
+
+    @staticmethod
+    def _assignment_hints(source_units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Extract bounded, local assignment flow hints from already selected source code."""
+        assignment = re.compile(
+            r"^\s*(?P<target>[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_]*"
+            r"(?:\.[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_]*){0,4})\s*=\s*(?P<expr>.+?)\s*;?\s*$"
+        )
+        path_re = re.compile(
+            r"[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_]*"
+            r"(?:\.[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_]*)+"
+        )
+        result: list[dict[str, Any]] = []
+        for unit in source_units:
+            if unit.get("unit_kind") == "metadata":
+                continue
+            start = int(unit.get("line_start", 1))
+            for offset, line in enumerate(str(unit.get("source", "")).splitlines()):
+                match = assignment.match(line)
+                if match is None:
+                    continue
+                target = match.group("target")
+                expression = match.group("expr").strip()
+                normalized_target = normalize(target)
+                if normalized_target in {"запростекст", "querytext"}:
+                    continue
+                interesting = "." in target or any(
+                    marker in normalized_target
+                    for marker in ("сумм", "курс", "кратност", "ндс", "всего", "итог")
+                )
+                if not interesting:
+                    continue
+                result.append(
+                    {
+                        "project": unit["project"],
+                        "file": unit["file"],
+                        "line": start + offset,
+                        "symbol": unit["symbol"],
+                        "target": target,
+                        "expression": expression[:1000],
+                        "sources": list(dict.fromkeys(path_re.findall(expression)))[:12],
+                    }
+                )
+                if len(result) >= 160:
+                    return result
         return result
 
     @staticmethod
@@ -739,8 +1160,12 @@ class RetrievalService:
             symbol_rows = list(
                 self.session.scalars(
                     select(Symbol)
-                    .where(Symbol.project_id == project.id, Symbol.name.like(pattern))
-                    .order_by(Symbol.name)
+                    .join(Module, Module.id == Symbol.module_id)
+                    .where(
+                        Symbol.project_id == project.id,
+                        or_(Symbol.name.like(pattern), Module.full_name.like(pattern)),
+                    )
+                    .order_by(Module.full_name, Symbol.name)
                     .limit(limit - len(result))
                 )
             )
@@ -941,6 +1366,9 @@ class RetrievalService:
         *,
         primary_project_id: int,
         priority_keys: set[tuple[int, int]] | None = None,
+        preferred_writers: set[tuple[int, int]] | None = None,
+        preferred_graph: set[tuple[int, int]] | None = None,
+        search_terms: tuple[str, ...] = (),
     ) -> list[dict[str, Any]]:
         if not symbol_keys:
             return []
@@ -953,10 +1381,61 @@ class RetrievalService:
         result: list[dict[str, Any]] = []
         used = 0
         priority = priority_keys or set()
+        focused_writers = preferred_writers or set()
+        focused_graph = preferred_graph or set()
+        terms = {normalize(term) for term in search_terms if len(normalize(term)) >= 4}
+        source_cache: dict[tuple[int, int], list[str]] = {}
+
+        def source_lines(symbol: Symbol) -> list[str]:
+            key = (symbol.project_id, symbol.source_file_id)
+            if key not in source_cache:
+                project = projects[symbol.project_id]
+                file = files_by_project[symbol.project_id].get(symbol.source_file_id)
+                if file is None or not project.source_path:
+                    source_cache[key] = []
+                else:
+                    try:
+                        path = Path(project.source_path).joinpath(
+                            *PurePosixPath(file.relative_path).parts
+                        )
+                        source_cache[key] = read_text(path).splitlines()
+                    except OSError:
+                        source_cache[key] = []
+            return source_cache[key]
+
+        def term_score(symbol: Symbol) -> int:
+            if not terms:
+                return 0
+            name = normalize(f"{modules[symbol.module_id].full_name}.{symbol.name}")
+            procedure_name = normalize(symbol.name)
+            # Score only the procedure's own body, not adjacent procedures in its excerpt.
+            body = normalize(
+                "\n".join(source_lines(symbol)[symbol.line_start - 1 : symbol.line_end])
+            )
+            return sum(
+                min(len(term), 32)
+                * (
+                    10
+                    if term in procedure_name
+                    else 2
+                    if term in name
+                    else 1
+                    if term in body
+                    else 0
+                )
+                for term in terms
+            )
+
         for symbol in sorted(
             symbols,
             key=lambda item: (
+                0
+                if (item.project_id, item.id) in focused_writers
+                else 1
+                if (item.project_id, item.id) in focused_graph
+                else 2,
                 0 if (item.project_id, item.id) in priority else 1,
+                -term_score(item),
                 0 if item.project_id == primary_project_id else 1,
                 item.project_id,
                 item.source_file_id,
@@ -969,14 +1448,9 @@ class RetrievalService:
             source_file = files_by_project[symbol.project_id].get(symbol.source_file_id)
             if source_file is None or not project.source_path:
                 continue
-            source_path = Path(project.source_path).joinpath(
-                *PurePosixPath(source_file.relative_path).parts
-            )
-            try:
-                text = read_text(source_path)
-            except OSError:
+            lines = source_lines(symbol)
+            if not lines:
                 continue
-            lines = text.splitlines()
             start = max(1, symbol.line_start - 3)
             end = min(len(lines), symbol.line_end + 3)
             source = "\n".join(lines[start - 1 : end])
@@ -986,6 +1460,7 @@ class RetrievalService:
             module = modules[symbol.module_id]
             result.append(
                 {
+                    "unit_kind": "symbol",
                     "project": project.name,
                     "project_id": project.id,
                     "symbol_id": symbol.id,

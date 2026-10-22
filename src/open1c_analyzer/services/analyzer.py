@@ -238,6 +238,8 @@ _PLATFORM_QUALIFIERS = {
     )
 }
 _MANAGER_QUALIFIERS = {normalize(item) for item in MANAGER_KIND}
+_ANALYSIS_SCHEMA_VERSION = "3"
+_ANALYSIS_SCHEMA_KEY = "Open1CAnalysisSchemaVersion"
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,12 +298,14 @@ class AnalyzerCore:
         skipped = 0
         errors: list[str] = []
         profile = self._profile(project)
+        parser_upgrade = profile.get(_ANALYSIS_SCHEMA_KEY) != _ANALYSIS_SCHEMA_VERSION
+        reanalyze_all = force or parser_upgrade
 
         for source_file in self.catalog.list_files(project):
             if not self._analyzable(source_file):
                 continue
             if (
-                not force
+                not reanalyze_all
                 and source_file.analyzed_checksum == source_file.checksum
                 and not source_file.analysis_error
             ):
@@ -327,11 +331,15 @@ class AnalyzerCore:
                 source_file.analyzed_checksum = None
                 errors.append(message)
 
+        profile[_ANALYSIS_SCHEMA_KEY] = _ANALYSIS_SCHEMA_VERSION
         project.profile_json = (
             json.dumps(profile, ensure_ascii=False, sort_keys=True) if profile else None
         )
         graph_rebuilt = (
-            force or analyzed > 0 or bool(scan_result and scan_result.removed) or bool(include)
+            reanalyze_all
+            or analyzed > 0
+            or bool(scan_result and scan_result.removed)
+            or bool(include)
         )
         if graph_rebuilt:
             self._resolve(project, self._included_projects(project, include))
@@ -415,6 +423,13 @@ class AnalyzerCore:
             return False
         path = PurePosixPath(source_file.relative_path)
         if path.name.casefold() == "configuration.xml":
+            return True
+        parts = path.parts
+        if (
+            path.name.casefold() == "form.xml"
+            and "Forms" in parts
+            and parts.index("Forms") + 2 < len(parts)
+        ):
             return True
         return len(path.parts) == 2 and path.suffix.casefold() == ".xml"
 
@@ -616,11 +631,15 @@ class AnalyzerCore:
 
         for module in primary_modules:
             owner_kind = module.owner_kind
-            owner = (
-                metadata_by_kind_name.get((owner_kind, normalize(module.owner_name or "")))
-                if owner_kind
-                else None
-            )
+            if module.module_kind == "form_module" and ".Form." in module.full_name:
+                form_full_name = module.full_name.rsplit(".form_module", 1)[0]
+                owner = aliases.get(normalize(form_full_name))
+            else:
+                owner = (
+                    metadata_by_kind_name.get((owner_kind, normalize(module.owner_name or "")))
+                    if owner_kind
+                    else None
+                )
             if owner:
                 module.metadata_object_id = owner.id
                 self._edge(
@@ -665,6 +684,22 @@ class AnalyzerCore:
                         (normalize(qualifier), symbol.normalized_name), []
                     ).append(symbol)
 
+        document_managers: dict[tuple[str, str], list[Symbol]] = {}
+        included_document_managers: dict[tuple[str, str], list[Symbol]] = {}
+        for pool, index in (
+            (primary_symbols, document_managers),
+            (included_symbols, included_document_managers),
+        ):
+            for symbol in pool:
+                module = modules_by_id[symbol.module_id]
+                if (
+                    symbol.is_export
+                    and module.module_kind == "manager_module"
+                    and module.owner_kind == "document"
+                ):
+                    key = (normalize(module.owner_name or ""), symbol.normalized_name)
+                    index.setdefault(key, []).append(symbol)
+
         symbols_by_id = {item.id: item for item in primary_symbols}
         calls = list(
             self.session.scalars(select(CallSite).where(CallSite.project_id == project.id))
@@ -675,7 +710,27 @@ class AnalyzerCore:
             caller = symbols_by_id.get(call.caller_symbol_id) if call.caller_symbol_id else None
             candidates: list[Symbol] = []
             qualifier_root = normalize(call.qualifier.split(".")[0]) if call.qualifier else ""
-            if call.qualifier:
+            qualifier_parts = call.qualifier.split(".") if call.qualifier else []
+            if len(qualifier_parts) == 2 and qualifier_root in {
+                normalize("Документы"),
+                normalize("Documents"),
+            }:
+                # Only exported members of this document's manager are callable here.
+                # Never fall back to a same-named object/form/common-module method.
+                document_name = normalize(qualifier_parts[1])
+                for manager_index, resolution in (
+                    (document_managers, "document_manager"),
+                    (included_document_managers, "included_document_manager"),
+                ):
+                    candidates = manager_index.get((document_name, call.normalized_name), [])
+                    if candidates:
+                        call.resolution = (
+                            resolution if len(candidates) == 1 else "ambiguous_document_manager"
+                        )
+                        break
+                if not candidates:
+                    call.resolution = "platform_api"
+            elif call.qualifier:
                 if caller and qualifier_root in {normalize("ЭтотОбъект"), normalize("ThisObject")}:
                     candidates = local_symbols.get((caller.module_id, call.normalized_name), [])
                     if len(candidates) == 1:
@@ -776,7 +831,11 @@ class AnalyzerCore:
         for reference in self.session.scalars(
             select(Reference).where(Reference.project_id == project.id)
         ):
-            target_metadata = self._resolve_metadata(reference.target_full_name, aliases)
+            target_metadata = (
+                self._resolve_register(reference.target_name, all_metadata, project.id)
+                if reference.target_kind == "register"
+                else self._resolve_metadata(reference.target_full_name, aliases)
+            )
             reference.metadata_object_id = target_metadata.id if target_metadata else None
             source_symbol = symbols_by_id.get(reference.symbol_id) if reference.symbol_id else None
             source_module = modules_by_file.get(reference.source_file_id)
@@ -876,6 +935,30 @@ class AnalyzerCore:
             (key, item) for key, item in aliases.items() if len(key) > 4 and value.startswith(key)
         ]
         return max(matches, key=lambda pair: len(pair[0]))[1] if matches else None
+
+    @staticmethod
+    def _resolve_register(
+        raw_name: str,
+        items: list[MetadataObject],
+        primary_project_id: int,
+    ) -> MetadataObject | None:
+        needle = normalize(raw_name)
+        candidates = [
+            item
+            for item in items
+            if item.kind
+            in {
+                "accounting_register",
+                "accumulation_register",
+                "calculation_register",
+                "information_register",
+            }
+            and normalize(item.name) == needle
+        ]
+        primary = [item for item in candidates if item.project_id == primary_project_id]
+        if len(primary) == 1:
+            return primary[0]
+        return candidates[0] if len(candidates) == 1 else None
 
     def _edge(
         self,

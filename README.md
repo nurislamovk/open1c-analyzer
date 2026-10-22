@@ -33,6 +33,11 @@ uv run open1c project summary TMS
 A repeated `analyze` is incremental: unchanged files and the existing graph are
 reused. Use `--force` for a complete rebuild.
 
+When an Open1C Analyzer release changes the source-analysis schema, the first
+`analyze` after the upgrade automatically reparses analyzable files once and stores
+the new analysis-schema version in the project profile. Subsequent runs are
+incremental again.
+
 ```powershell
 uv run open1c project analyze TMS --force
 ```
@@ -69,6 +74,9 @@ The analyzer stores:
 - method calls with local, common-module, qualified, platform, dynamic and ambiguous classification;
 - query text and table usage for read, write, update and delete operations;
 - explicit references to documents, catalogs, registers and other metadata managers;
+- managed forms as first-class metadata, with distinct form-module identities;
+- register-writer dependencies from document movements, `ОтразитьДвижения(...)` and
+  programmatic record-set writes;
 - resolved and unresolved dependency edges between metadata, modules, methods and queries.
 
 This is static analysis. Dynamic execution, names assembled at runtime and some
@@ -116,6 +124,29 @@ uv run open1c context TMS "РассчитатьПотребности" `
 The context schema is `open1c-analyzer-context-v1`. It is bounded by source-unit
 and character limits and is intended for a concrete engineering task, unlike the
 full project snapshot.
+
+For managed forms, focused context now includes compact `Form.xml` evidence for the
+selected form (events, the main `Список` table, dynamic-list query and `MainTable`) plus
+the linked form module. Natural-language questions that explicitly mention a document
+list form are ranked toward `...Form.ФормаСписка` instead of unrelated manager-module
+methods.
+
+Register retrieval distinguishes readers from writers. Common write surfaces are indexed
+as `register_write`, including mutations of `Движения.<Регистр>` and explicit
+`Записывать = Истина` (reading movements or disabling writes is not a write),
+`ПроведениеДокументовУНФ.ОтразитьДвижения("<Регистр>", ...)` and record sets that are
+created through a register manager and subsequently written through the same variable
+before it is reassigned. Binding tracking is local and follows source order; it does
+not infer branch-dependent aliases. Context generation expands
+the call graph around those writer symbols and emits bounded `data_flow` assignment hints,
+which makes questions such as "where is resource Всего formed?" traceable past the final
+register write into preparation/calculation code.
+
+Document-manager calls such as `Документы.РасходнаяНакладная.Рассчитать(...)`
+resolve to the named document's exported manager procedure, including across an
+extension/base boundary. For register questions, explicitly naming a document
+prioritizes its writer and calculation neighborhood. Planner search terms also
+rank matching procedure names and bodies within the bounded source context.
 
 A separately indexed extension can be included in focused retrieval. Run
 `project resolve` with the base configuration first to persist conservative
