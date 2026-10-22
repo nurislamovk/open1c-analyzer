@@ -391,6 +391,14 @@ class QuestionPlanner:
                 "No indexed 1C entities matched the question. Use --term with an exact "
                 "object, module or method name."
             )
+        qualified_names = {
+            normalize(match.group(0)) for match in self._qualified_re.finditer(question)
+        }
+        explicit_symbols = [
+            item
+            for item in planned_matches
+            if item.entity.kind == "symbol" and normalize(item.entity.name) in qualified_names
+        ]
         if self._form_list_intent(question):
             form_matches = [
                 item
@@ -416,6 +424,30 @@ class QuestionPlanner:
                 selected_match = register_matches[0]
                 planned_matches.remove(selected_match)
                 planned_matches.insert(0, selected_match)
+        elif explicit_symbols:
+            selected_match = explicit_symbols[0]
+            planned_matches.remove(selected_match)
+            planned_matches.insert(0, selected_match)
+        else:
+            words = {normalize(word) for word in self._word_re.findall(question)}
+            named_documents = [
+                item.entity
+                for item in planned_matches
+                if item.entity.kind == "metadata"
+                and "kind=document;" in item.entity.details
+                and normalize(item.entity.name.rsplit(".", 1)[-1]) in words
+            ]
+            handlers = self.retrieval.posting_entry_points(named_documents, question=question)
+            if handlers:
+                project_rank = {
+                    name: index
+                    for index, name in enumerate(dict.fromkeys((project_name, *include)))
+                }
+                handler = min(handlers, key=lambda item: (project_rank[item.project], item.name))
+                planned_matches = [item for item in planned_matches if item.entity != handler]
+                planned_matches.insert(
+                    0, PlannedMatch(planned_matches[0].score + 1, (handler.name,), handler)
+                )
         selected = planned_matches[0].entity.name
         return AskPlan(question, terms, selected, tuple(planned_matches[:limit]))
 
