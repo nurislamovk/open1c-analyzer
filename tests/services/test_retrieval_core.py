@@ -10,6 +10,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from open1c_analyzer.services.analyzer import AnalyzerCore
+from open1c_analyzer.services.ask import AskService, QuestionPlanner
 from open1c_analyzer.services.project_catalog import ProjectCatalog
 from open1c_analyzer.services.retrieval import RetrievalService
 from open1c_analyzer.storage.models import Base, CallSite, Module, Reference, Symbol
@@ -70,6 +71,207 @@ def _configuration(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return source
+
+
+@pytest.mark.parametrize("limit", [1, 20])
+@pytest.mark.parametrize("lowercase", [False, True])
+def test_qualified_symbol_lookup_filters_owner_before_limit(
+    tmp_path: Path, limit: int, lowercase: bool
+) -> None:
+    source = _configuration(tmp_path)
+    for index in range(85):
+        name = f"Шум{index}"
+        _metadata(source / "CommonModules" / f"{name}.xml", "CommonModule", name)
+        distractor = source / "CommonModules" / name / "Ext" / "Module.bsl"
+        distractor.parent.mkdir(parents=True)
+        distractor.write_text(
+            "Процедура ОбработкаПроведения() Экспорт\nКонецПроцедуры", encoding="utf-8"
+        )
+    term = "Документ.Заказ.object_module.ОбработкаПроведения"
+    with _session() as session:
+        catalog = ProjectCatalog(session)
+        catalog.add_project("Base", source)
+        extension = tmp_path / "extension"
+        extension.mkdir()
+        catalog.add_project("Extension", extension)
+        AnalyzerCore(session).analyze_project("Base")
+        retrieval = RetrievalService(session)
+        for project, include in (("Base", ()), ("Extension", ("Base",))):
+            matches = retrieval.find(
+                project, term.lower() if lowercase else term, include=include, limit=limit
+            )
+            assert [item.name for item in matches] == [term]
+            assert (
+                retrieval.find(
+                    project,
+                    "Документ.Несуществующий.object_module.ОбработкаПроведения",
+                    include=include,
+                    limit=limit,
+                )
+                == []
+            )
+            payload = retrieval.build_context(project, term, include=include, max_units=1)
+            assert payload["source_units"][0]["symbol"] == term
+            assert "Процедура ОбработкаПроведения" in payload["source_units"][0]["source"]
+
+
+def _posting_configuration(root: Path, *, graph: bool = True) -> Path:
+    source = root / "posting"
+    for name in ("Отгрузка", "ЧужойДокумент"):
+        _metadata(source / "Documents" / f"{name}.xml", "Document", name)
+        module = source / "Documents" / name / "Ext" / "ObjectModule.bsl"
+        module.parent.mkdir(parents=True)
+        module.write_text(
+            "Процедура ОбработкаПроведения(Отказ)\n"
+            + (f"Документы.{name}.РассчитатьПроведение();\n" if graph else "")
+            + "КонецПроцедуры",
+            encoding="utf-8",
+        )
+        manager = module.with_name("ManagerModule.bsl")
+        manager.write_text(
+            "Процедура РассчитатьПроведение() Экспорт\n"
+            "Строка.Всего = Данные.Сумма;\nКонецПроцедуры\n"
+            + "\n".join(
+                f"Процедура ПечатьПроведения{index}() Экспорт\n"
+                f'Текст = "Проведение {"шум" * 1200}";\nКонецПроцедуры'
+                for index in range(35)
+            ),
+            encoding="utf-8",
+        )
+    return source
+
+
+@pytest.mark.parametrize("included", [False, True])
+def test_posting_context_reserves_graph_backed_handler_before_wide_metadata_seeds(
+    tmp_path: Path, included: bool
+) -> None:
+    source = _posting_configuration(tmp_path)
+    with _session() as session:
+        catalog = ProjectCatalog(session)
+        catalog.add_project("Base", source)
+        extension = tmp_path / "extension"
+        extension.mkdir()
+        catalog.add_project("Extension", extension)
+        AnalyzerCore(session).analyze_project("Base")
+        payload = RetrievalService(session).build_context(
+            "Extension" if included else "Base",
+            "Документ.Отгрузка",
+            include=("Base",) if included else (),
+            question="Как проводится документ Отгрузка? Покажи обработчик проведения.",
+            search_terms=("Отгрузка", "проведения"),
+            depth=2,
+        )
+    units = payload["source_units"]
+    assert units[0]["symbol"] == "Документ.Отгрузка.object_module.ОбработкаПроведения"
+    assert any(unit["symbol"].endswith("manager_module.РассчитатьПроведение") for unit in units)
+    assert all("ЧужойДокумент" not in unit["symbol"] for unit in units)
+    assert payload["limits"]["actual_source_characters"] <= 60_000
+    assert len(units) <= 30
+    assert any(flow["target"] == "Строка.Всего" for flow in payload["data_flow"])
+    assert any(
+        edge["source"].endswith("object_module.ОбработкаПроведения")
+        and edge["target"].endswith("manager_module.РассчитатьПроведение")
+        for edge in payload["impact"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("graph", "question"),
+    [
+        (False, "Как проводится документ Отгрузка?"),
+        (True, "Как печатается документ Отгрузка?"),
+        (True, "Как печатается документ Отгрузка из проводника?"),
+    ],
+)
+def test_posting_handler_is_not_promoted_without_intent_and_graph_evidence(
+    tmp_path: Path, graph: bool, question: str
+) -> None:
+    source = _posting_configuration(tmp_path, graph=graph)
+    with _session() as session:
+        ProjectCatalog(session).add_project("Base", source)
+        AnalyzerCore(session).analyze_project("Base")
+        payload = RetrievalService(session).build_context(
+            "Base", "Документ.Отгрузка", question=question, max_units=1
+        )
+    assert payload["source_units"][0]["symbol"] != (
+        "Документ.Отгрузка.object_module.ОбработкаПроведения"
+    )
+
+
+@pytest.mark.parametrize("include", [("Base",), ("Base", "Extension", "Base")])
+def test_qualified_lookup_and_context_keep_extension_ahead_of_base(
+    tmp_path: Path, include: tuple[str, ...]
+) -> None:
+    with _session() as session:
+        catalog = ProjectCatalog(session)
+        analyzer = AnalyzerCore(session)
+        for project in ("Base", "Extension"):
+            root = tmp_path / project
+            source = _configuration(root)
+            if project == "Base":
+                module = source / "Documents" / "Заказ" / "Ext" / "ObjectModule.bsl"
+                module.write_text(
+                    module.read_text(encoding="utf-8").replace(
+                        "КонецПроцедуры", "Строка.Всего = Данные.Сумма;\nКонецПроцедуры"
+                    ),
+                    encoding="utf-8",
+                )
+            catalog.add_project(project, source)
+            analyzer.analyze_project(project)
+        retrieval = RetrievalService(session)
+        term = "Документ.Заказ.object_module.ОбработкаПроведения"
+        matches = retrieval.find("Extension", term, include=include, limit=1)
+        payload = retrieval.build_context(
+            "Extension", term, include=include, max_units=1, search_terms=("Всего",)
+        )
+        plan = QuestionPlanner(retrieval).plan(
+            "Extension", "Как проводится документ Заказ?", include=include
+        )
+    assert [match.project for match in matches] == ["Extension"]
+    assert payload["source_units"][0]["project"] == "Extension"
+    assert payload["source_units"][0]["symbol"] == term
+    assert plan.matches[0].entity.project == "Extension"
+    assert plan.selected_term == term
+
+
+def test_ask_posting_question_keeps_handler_manager_and_flow(tmp_path: Path) -> None:
+    source = _posting_configuration(tmp_path)
+    with _session() as session:
+        ProjectCatalog(session).add_project("Demo", source)
+        AnalyzerCore(session).analyze_project("Demo")
+        result = AskService(session).ask(
+            "Demo",
+            "Как проводится документ Отгрузка? "
+            "Покажи обработчик проведения и вызываемые процедуры.",
+            dry_run=True,
+            output_root=tmp_path / "runs",
+        )
+    payload = json.loads(result.context_path.read_text(encoding="utf-8"))
+    assert payload["source_units"][0]["symbol"] == (
+        "Документ.Отгрузка.object_module.ОбработкаПроведения"
+    )
+    assert any(
+        unit["symbol"] == "Документ.Отгрузка.manager_module.РассчитатьПроведение"
+        for unit in payload["source_units"]
+    )
+    assert any(flow["target"] == "Строка.Всего" for flow in payload["data_flow"])
+
+
+def test_posting_intent_does_not_replace_explicit_manager_procedure(tmp_path: Path) -> None:
+    source = _posting_configuration(tmp_path)
+    term = "Документ.Отгрузка.manager_module.РассчитатьПроведение"
+    with _session() as session:
+        ProjectCatalog(session).add_project("Demo", source)
+        AnalyzerCore(session).analyze_project("Demo")
+        result = AskService(session).ask(
+            "Demo",
+            f"Как работает {term} при проведении документа Отгрузка?",
+            dry_run=True,
+            output_root=tmp_path / "runs",
+        )
+    payload = json.loads(result.context_path.read_text(encoding="utf-8"))
+    assert payload["request"]["term"] == term
+    assert payload["source_units"][0]["symbol"] == term
 
 
 def test_resolution_retrieval_impact_and_context(tmp_path: Path) -> None:

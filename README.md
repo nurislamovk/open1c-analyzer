@@ -125,6 +125,13 @@ The context schema is `open1c-analyzer-context-v1`. It is bounded by source-unit
 and character limits and is intended for a concrete engineering task, unlike the
 full project snapshot.
 
+Fully qualified procedure lookup filters by the owning module before applying the
+result limit, so unrelated methods with the same name cannot hide an exact match.
+Context selection keeps explicitly selected procedures ahead of broad module seeds.
+For posting questions about a named document, the planner prefers its object-module
+`ОбработкаПроведения` when resolved call or write dependencies confirm that entry point.
+Source excerpts and nearby dependencies still obey the configured context budget.
+
 For managed forms, focused context now includes compact `Form.xml` evidence for the
 selected form (events, the main `Список` table, dynamic-list query and `MainTable`) plus
 the linked form module. Natural-language questions that explicitly mention a document

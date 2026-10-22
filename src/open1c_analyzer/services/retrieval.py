@@ -399,6 +399,14 @@ class RetrievalService:
         projects = self._projects(project_name, include)
         project_by_id = {project.id: project for project in projects}
         matches = self.find(project_name, term, include=include, limit=20)
+        target_keys = self._context_target_keys(matches, question, search_terms)
+        target_graph_keys, target_graph_edges = self._symbol_dependency_neighborhood(
+            target_keys - {(item.project_id, item.id) for item in matches if item.kind == "symbol"},
+            project_by_id,
+            depth=depth,
+            limit=220,
+            search_terms=search_terms,
+        )
         call_rows = self.calls(
             project_name,
             term,
@@ -431,7 +439,12 @@ class RetrievalService:
         )
         seed_symbol_keys = self._seed_symbol_keys(matches, max_units=max_units)
         symbol_keys = (
-            set(seed_symbol_keys) | writer_symbol_keys | writer_graph_keys | preferred_graph_keys
+            set(seed_symbol_keys)
+            | writer_symbol_keys
+            | writer_graph_keys
+            | preferred_graph_keys
+            | target_keys
+            | target_graph_keys
         )
         project_by_name = {item.name: item for item in projects}
         for trace in call_rows:
@@ -462,8 +475,9 @@ class RetrievalService:
                 max(0, max_units - len(form_units)),
                 primary_project_id=projects[0].id,
                 priority_keys=seed_symbol_keys | writer_symbol_keys,
+                target_keys=target_keys,
                 preferred_writers=preferred_writers,
-                preferred_graph=preferred_graph_keys,
+                preferred_graph=preferred_graph_keys | target_graph_keys,
                 search_terms=search_terms,
             ),
         ]
@@ -481,7 +495,13 @@ class RetrievalService:
             limit=max(0, 300 - len(impact_rows)),
         )
         impact_rows = self._deduplicate_impact(
-            [*preferred_graph_edges, *impact_rows, *writer_graph_edges, *context_outgoing]
+            [
+                *target_graph_edges,
+                *preferred_graph_edges,
+                *impact_rows,
+                *writer_graph_edges,
+                *context_outgoing,
+            ]
         )[:300]
         queries = self._queries(selected_symbol_ids, project_by_id)
         unresolved = self._unresolved_near(selected_symbol_ids, project_by_id)
@@ -635,6 +655,83 @@ class RetrievalService:
             for symbol, module in rows
             if module.owner_kind == "document" and normalize(module.owner_name or "") in words
         }
+
+    def _context_target_keys(
+        self,
+        matches: list[EntityRef],
+        question: str,
+        search_terms: tuple[str, ...],
+    ) -> set[tuple[int, int]]:
+        """Keep explicit symbols and graph-backed posting entry points ahead of broad seeds."""
+        result = {(item.project_id, item.id) for item in matches if item.kind == "symbol"}
+        result.update(
+            (item.project_id, item.id)
+            for item in self.posting_entry_points(
+                matches, question=question, search_terms=search_terms
+            )
+        )
+        return result
+
+    def posting_entry_points(
+        self,
+        entities: Iterable[EntityRef],
+        *,
+        question: str,
+        search_terms: tuple[str, ...] = (),
+    ) -> list[EntityRef]:
+        """Find owned document posting handlers with resolved outgoing graph evidence."""
+        if not any(
+            word.casefold().startswith(("проведен", "проводит", "провести"))
+            or normalize(word) == normalize("ОбработкаПроведения")
+            for text in (question, *search_terms)
+            for word in re.findall(r"[\w]+", text)
+        ):
+            return []
+        owners = [item for item in entities if item.kind in {"metadata", "module"}]
+        if not owners:
+            return []
+        scopes = [
+            and_(
+                Module.project_id == item.project_id,
+                Module.metadata_object_id == item.id
+                if item.kind == "metadata"
+                else Module.id == item.id,
+            )
+            for item in owners
+        ]
+        graph_evidence = (
+            select(Dependency.id)
+            .where(
+                Dependency.project_id == Symbol.project_id,
+                Dependency.source_kind == "symbol",
+                Dependency.source_id == Symbol.id,
+                Dependency.is_resolved.is_(True),
+                Dependency.relation.in_(("calls", "register_write", "query_write")),
+            )
+            .exists()
+        )
+        symbols = list(
+            self.session.scalars(
+                select(Symbol)
+                .join(Module, Module.id == Symbol.module_id)
+                .where(
+                    or_(*scopes),
+                    Module.owner_kind == "document",
+                    Module.module_kind == "object_module",
+                    Symbol.normalized_name == normalize("ОбработкаПроведения"),
+                    graph_evidence,
+                )
+            )
+        )
+        modules = self._modules_for_symbols(symbols)
+        projects = {item.project_id: self.catalog.get_project(item.project) for item in owners}
+        files = {project_id: self._files(project_id) for project_id in projects}
+        return [
+            self._symbol_ref(
+                projects[item.project_id], item, modules[item.module_id], files[item.project_id]
+            )
+            for item in symbols
+        ]
 
     def _writer_symbol_keys(
         self,
@@ -1078,14 +1175,27 @@ class RetrievalService:
         exact_last = normalize(term.rsplit(".", 1)[-1])
         result: list[EntityRef] = []
 
-        symbols = list(
-            self.session.scalars(
-                select(Symbol)
-                .where(Symbol.project_id == project.id, Symbol.normalized_name == exact_last)
-                .order_by(Symbol.is_export.desc(), Symbol.name)
-                .limit(limit * 4)
-            )
+        symbol_query = (
+            select(Symbol)
+            .where(Symbol.project_id == project.id, Symbol.normalized_name == exact_last)
+            .order_by(Symbol.is_export.desc(), Symbol.name, Symbol.id)
         )
+        qualifier, separator, _leaf = term.rpartition(".")
+        if separator:
+            # Filter the owning module before limiting exact qualified matches.
+            symbols = list(
+                self.session.scalars(
+                    symbol_query.join(Module, Module.id == Symbol.module_id)
+                    .where(Module.full_name == qualifier)
+                    .limit(limit)
+                )
+            )
+            if not symbols:
+                # Preserve case-insensitive and partial qualified matching. Only the
+                # indexed leaf-name candidates are loaded, with no pre-filter cutoff.
+                symbols = list(self.session.scalars(symbol_query))
+        else:
+            symbols = list(self.session.scalars(symbol_query.limit(limit * 4)))
         modules = self._modules_for_symbols(symbols)
         for symbol in symbols:
             module = modules[symbol.module_id]
@@ -1366,6 +1476,7 @@ class RetrievalService:
         *,
         primary_project_id: int,
         priority_keys: set[tuple[int, int]] | None = None,
+        target_keys: set[tuple[int, int]] | None = None,
         preferred_writers: set[tuple[int, int]] | None = None,
         preferred_graph: set[tuple[int, int]] | None = None,
         search_terms: tuple[str, ...] = (),
@@ -1381,6 +1492,8 @@ class RetrievalService:
         result: list[dict[str, Any]] = []
         used = 0
         priority = priority_keys or set()
+        targets = target_keys or set()
+        project_rank = {project_id: index for index, project_id in enumerate(projects)}
         focused_writers = preferred_writers or set()
         focused_graph = preferred_graph or set()
         terms = {normalize(term) for term in search_terms if len(normalize(term)) >= 4}
@@ -1429,6 +1542,8 @@ class RetrievalService:
         for symbol in sorted(
             symbols,
             key=lambda item: (
+                0 if (item.project_id, item.id) in targets else 1,
+                project_rank[item.project_id] if (item.project_id, item.id) in targets else 0,
                 0
                 if (item.project_id, item.id) in focused_writers
                 else 1
