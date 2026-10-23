@@ -1,10 +1,12 @@
 """Project catalog and source-directory synchronization."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
+from sqlalchemy import insert
 from sqlalchemy.orm import Session
 
 from open1c_analyzer.storage.models import Project, SourceFile
@@ -117,7 +119,9 @@ class ProjectCatalog:
         """Return catalogued files for a project."""
         return self._files.list_for_project(project.id)
 
-    def scan_project(self, name: str) -> ScanResult:
+    def scan_project(
+        self, name: str, *, progress: Callable[[int, int], None] | None = None
+    ) -> ScanResult:
         """Synchronize the database file catalog with the source directory."""
         project = self.get_project(name)
         if project.source_path is None:
@@ -133,7 +137,13 @@ class ProjectCatalog:
         updated = 0
         unchanged = 0
 
-        for path in self._iter_source_files(root):
+        paths = self._iter_source_files(root)
+        pending: list[dict[str, object]] = []
+        if progress:
+            progress(0, len(paths))
+        for position, path in enumerate(paths):
+            if progress and position and position % 1000 == 0:
+                progress(position, len(paths))
             relative_path = path.relative_to(root).as_posix()
             seen.add(relative_path)
             stat = path.stat()
@@ -141,19 +151,25 @@ class ProjectCatalog:
             current = existing.get(relative_path)
 
             if current is None:
-                self._files.add(
-                    project_id=project.id,
-                    relative_path=relative_path,
-                    checksum=self._checksum(path),
-                    language=language,
-                    size_bytes=stat.st_size,
-                    modified_ns=stat.st_mtime_ns,
+                pending.append(
+                    dict(
+                        project_id=project.id,
+                        relative_path=relative_path,
+                        checksum=self._checksum(path),
+                        language=language,
+                        size_bytes=stat.st_size,
+                        modified_ns=stat.st_mtime_ns,
+                    )
                 )
+                if len(pending) >= 500:
+                    self._session.connection().execute(insert(SourceFile), pending)
+                    pending.clear()
                 added += 1
                 continue
 
             if current.size_bytes == stat.st_size and current.modified_ns == stat.st_mtime_ns:
-                current.language = language
+                if current.language != language:
+                    current.language = language
                 unchanged += 1
                 continue
 
@@ -168,9 +184,13 @@ class ProjectCatalog:
             current.checksum = checksum
             updated += 1
 
+        if pending:
+            self._session.connection().execute(insert(SourceFile), pending)
         removed = self._files.remove_not_in(project.id, seen)
         project.last_scanned_at = datetime.now(UTC)
         self._session.flush()
+        if progress:
+            progress(len(paths), len(paths))
 
         return ScanResult(
             added=added,

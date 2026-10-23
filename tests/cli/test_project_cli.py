@@ -49,6 +49,26 @@ def test_project_add_reports_invalid_directory(database_path: Path, tmp_path: Pa
     assert "does not exist" in result.stdout
 
 
+def test_analyze_reports_progress_and_quiet_preserves_summary(
+    database_path: Path, tmp_path: Path
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "Module.bsl").write_text(
+        'Процедура Тест()\nСообщить("x");\nКонецПроцедуры', encoding="utf-8"
+    )
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["project", "add", "Demo", str(source)]).exit_code == 0
+    progress = runner.invoke(app, ["project", "analyze", "Demo"])
+    assert progress.exit_code == 0, progress.output
+    assert all(f"[{stage}]" in progress.stdout for stage in ("scan", "files", "calls", "complete"))
+    quiet = runner.invoke(app, ["project", "analyze", "Demo", "--force", "--quiet"])
+    assert quiet.exit_code == 0, quiet.output
+    assert "[files]" not in quiet.stdout
+    assert "Project analyzed" in quiet.stdout
+    assert "errors 0" in quiet.stdout
+
+
 def test_project_resolve_accepts_included_project(database_path: Path, tmp_path: Path) -> None:
     base = tmp_path / "base"
     extension = tmp_path / "extension"

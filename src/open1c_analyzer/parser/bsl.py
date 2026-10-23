@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+from bisect import bisect_left
 from dataclasses import dataclass
 from hashlib import sha256
+from operator import attrgetter
 
 from open1c_analyzer.parser.names import MANAGER_KIND, TYPE_KIND, full_metadata_name, normalize
 from open1c_analyzer.parser.query import QueryTable, analyze_query
@@ -700,4 +702,9 @@ class BslAnalyzer:
 
     @staticmethod
     def _symbol_at(symbols: list[ParsedSymbol], line: int) -> ParsedSymbol | None:
-        return next((item for item in symbols if item.line_start <= line <= item.line_end), None)
+        # Declaration end lines are ordered, including declarations on the same line.
+        # Searching end lines preserves the previous first-containing-symbol semantics.
+        index = bisect_left(symbols, line, key=attrgetter("line_end"))
+        if index < len(symbols) and symbols[index].line_start <= line:
+            return symbols[index]
+        return None

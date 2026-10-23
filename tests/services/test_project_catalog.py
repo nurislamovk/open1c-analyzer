@@ -100,3 +100,20 @@ def test_remove_project_deletes_catalog(tmp_path: Path) -> None:
         catalog.remove_project("Demo")
 
         assert catalog.list_projects() == []
+
+
+def test_bulk_scan_retains_all_files_and_removes_stale_rows(tmp_path: Path) -> None:
+    for number in range(1001):
+        (tmp_path / f"Module{number:04}.bsl").write_text("// input", encoding="utf-8")
+    with _session() as session:
+        catalog = ProjectCatalog(session)
+        project = catalog.add_project("Large", tmp_path)
+        first = catalog.scan_project("Large")
+        assert first.added == 1001
+        assert len(catalog.list_files(project)) == 1001
+        assert catalog.scan_project("Large").unchanged == 1001
+        (tmp_path / "Module0000.bsl").unlink()
+        (tmp_path / "Module1000.bsl").unlink()
+        last = catalog.scan_project("Large")
+        assert (last.removed, last.unchanged) == (2, 999)
+        assert catalog.file_count(project) == 999

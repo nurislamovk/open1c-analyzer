@@ -1,18 +1,39 @@
 """Project catalog and analyzer CLI commands."""
 
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
+from time import monotonic
 from typing import Annotated, Never
 
 import typer
 from rich.table import Table
 
 from open1c_analyzer.cli.common import console, database_session
-from open1c_analyzer.services.analyzer import AnalyzerCore
+from open1c_analyzer.services.analyzer import AnalysisProgress, AnalyzerCore
 from open1c_analyzer.services.knowledge import KnowledgeService
 from open1c_analyzer.services.project_catalog import ProjectCatalog, ProjectCatalogError
 
 project_app = typer.Typer(no_args_is_help=True, help="Manage and analyze 1C source projects.")
+
+
+def _progress_reporter() -> Callable[[AnalysisProgress], None]:
+    started = monotonic()
+    last_time = started
+    last_stage = ""
+
+    def report(event: AnalysisProgress) -> None:
+        nonlocal last_time, last_stage
+        now = monotonic()
+        if event.stage != last_stage or event.completed == event.total or now - last_time >= 2:
+            console.print(
+                f"[{event.stage}] {event.completed:,}/{event.total:,} "
+                f"({now - started:.1f}s) {event.detail}",
+                markup=False,
+            )
+            last_time, last_stage = now, event.stage
+
+    return report
 
 
 def _fail(message: str) -> Never:
@@ -101,16 +122,20 @@ def analyze_project(
         list[str] | None,
         typer.Option("--include", help="Resolve against another analyzed project."),
     ] = None,
+    quiet: Annotated[bool, typer.Option("--quiet", help="Suppress intermediate progress.")] = False,
 ) -> None:
     """Collect metadata, BSL, calls, queries and dependency edges."""
     try:
+        progress = None if quiet else _progress_reporter()
         with database_session() as session:
-            result = AnalyzerCore(session).analyze_project(
+            result = AnalyzerCore(session, progress=progress).analyze_project(
                 name,
                 force=force,
                 scan=not no_scan,
                 include=tuple(include or ()),
             )
+        if progress:
+            progress(AnalysisProgress("complete", 1, 1, "Index committed"))
         console.print(f"Project analyzed: [bold]{name}[/bold]")
         console.print(
             f"Scan changes: +{result.scanned_added} "
@@ -142,11 +167,17 @@ def resolve_project(
         list[str] | None,
         typer.Option("--include", help="Resolve against another analyzed project."),
     ] = None,
+    quiet: Annotated[bool, typer.Option("--quiet", help="Suppress intermediate progress.")] = False,
 ) -> None:
     """Rebuild call resolution and dependency edges without re-reading source files."""
     try:
+        progress = None if quiet else _progress_reporter()
         with database_session() as session:
-            result = AnalyzerCore(session).resolve_project(name, include=tuple(include or ()))
+            result = AnalyzerCore(session, progress=progress).resolve_project(
+                name, include=tuple(include or ())
+            )
+        if progress:
+            progress(AnalysisProgress("complete", 1, 1, "Index committed"))
         console.print(f"Graph resolved: [bold]{name}[/bold]")
         console.print(
             f"Calls: {result.calls}; resolved {result.resolved}; "
