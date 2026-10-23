@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import lru_cache
 from hashlib import sha256
+from itertools import islice
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import Row, bindparam, delete, func, insert, select
 from sqlalchemy.orm import Session
 
 from open1c_analyzer.parser import BslAnalyzer, MetadataParser, identify_module, read_text
@@ -272,14 +275,88 @@ class ResolutionResult:
     dependencies: int
 
 
+@dataclass(frozen=True, slots=True)
+class AnalysisProgress:
+    stage: str
+    completed: int
+    total: int
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class _Symbol:
+    id: int
+    project_id: int
+    module_id: int
+    name: str
+    normalized_name: str
+    is_export: bool
+
+
+_BATCH_SIZE = 1000
+
+
 class AnalyzerCore:
     """Build the facts required for later task analysis and LLM context selection."""
 
-    def __init__(self, session: Session) -> None:
+    def __init__(
+        self, session: Session, *, progress: Callable[[AnalysisProgress], None] | None = None
+    ) -> None:
         self.session = session
         self.catalog = ProjectCatalog(session)
         self.bsl = BslAnalyzer()
         self.metadata = MetadataParser()
+        self.progress = progress
+        self._edges: list[dict[str, Any]] = []
+
+    def _emit(self, stage: str, completed: int, total: int, detail: str = "") -> None:
+        if self.progress is not None:
+            self.progress(AnalysisProgress(stage, completed, total, detail))
+
+    def _insert_rows(self, model: type[Any], rows: Iterable[dict[str, Any]]) -> None:
+        iterator = iter(rows)
+        while batch := list(islice(iterator, _BATCH_SIZE)):
+            self.session.connection().execute(model.__table__.insert(), batch)
+
+    def _batches(self, model: type[Any], project_id: int) -> Iterator[list[Row[Any]]]:
+        table = model.__table__
+        last_id = 0
+        while rows := list(
+            self.session.connection().execute(
+                select(table)
+                .where(table.c.project_id == project_id, table.c.id > last_id)
+                .order_by(table.c.id)
+                .limit(_BATCH_SIZE)
+            )
+        ):
+            last_id = rows[-1].id
+            yield rows
+
+    def _update_rows(self, model: type[Any], rows: list[dict[str, Any]]) -> None:
+        if rows:
+            table = model.__table__
+            self.session.connection().execute(
+                table.update().where(table.c.id == bindparam("_key")), rows
+            )
+
+    def _symbols(self, project_ids: tuple[int, ...]) -> list[_Symbol]:
+        return [
+            _Symbol(*row)
+            for row in self.session.execute(
+                select(
+                    Symbol.id,
+                    Symbol.project_id,
+                    Symbol.module_id,
+                    Symbol.name,
+                    Symbol.normalized_name,
+                    Symbol.is_export,
+                ).where(Symbol.project_id.in_(project_ids))
+            )
+        ]
+
+    def _flush_edges(self) -> None:
+        self._insert_rows(Dependency, self._edges)
+        self._edges.clear()
 
     def analyze_project(
         self,
@@ -293,7 +370,14 @@ class AnalyzerCore:
         if not project.source_path:
             raise SourceDirectoryError(f"Project has no source directory: {name}")
         root = Path(project.source_path)
-        scan_result = self.catalog.scan_project(name) if scan else None
+        self._emit("scan", 0, 0, "Discovering source files" if scan else "Using file catalog")
+        scan_result = (
+            self.catalog.scan_project(
+                name, progress=lambda done, total: self._emit("scan", done, total)
+            )
+            if scan
+            else None
+        )
         analyzed = 0
         skipped = 0
         errors: list[str] = []
@@ -301,15 +385,16 @@ class AnalyzerCore:
         parser_upgrade = profile.get(_ANALYSIS_SCHEMA_KEY) != _ANALYSIS_SCHEMA_VERSION
         reanalyze_all = force or parser_upgrade
 
-        for source_file in self.catalog.list_files(project):
-            if not self._analyzable(source_file):
-                continue
+        files = [item for item in self.catalog.list_files(project) if self._analyzable(item)]
+        self._emit("files", 0, len(files))
+        for position, source_file in enumerate(files, 1):
             if (
                 not reanalyze_all
                 and source_file.analyzed_checksum == source_file.checksum
                 and not source_file.analysis_error
             ):
                 skipped += 1
+                self._emit("files", position, len(files), source_file.relative_path)
                 continue
             relative_path = source_file.relative_path
             try:
@@ -330,6 +415,7 @@ class AnalyzerCore:
                 source_file.analysis_error = message
                 source_file.analyzed_checksum = None
                 errors.append(message)
+            self._emit("files", position, len(files), relative_path)
 
         profile[_ANALYSIS_SCHEMA_KEY] = _ANALYSIS_SCHEMA_VERSION
         project.profile_json = (
@@ -354,6 +440,7 @@ class AnalyzerCore:
             )
             or 0
         )
+        self._emit("ready", len(files), len(files), "Waiting for transaction commit")
         return AnalysisResult(
             scan_result.added if scan_result else 0,
             scan_result.updated if scan_result else 0,
@@ -434,12 +521,15 @@ class AnalyzerCore:
         return len(path.parts) == 2 and path.suffix.casefold() == ".xml"
 
     def _clear_file(self, file_id: int) -> None:
-        self.session.execute(delete(Reference).where(Reference.source_file_id == file_id))
-        self.session.execute(delete(CallSite).where(CallSite.source_file_id == file_id))
-        self.session.execute(delete(QueryFact).where(QueryFact.source_file_id == file_id))
-        self.session.execute(delete(Symbol).where(Symbol.source_file_id == file_id))
-        self.session.execute(delete(Module).where(Module.source_file_id == file_id))
-        self.session.execute(delete(MetadataObject).where(MetadataObject.source_file_id == file_id))
+        # Python predicate evaluation visits the entire Session identity map for each
+        # DELETE, including every catalogued SourceFile. RETURNING synchronizes only
+        # the affected identities and still marks cached deleted facts as deleted.
+        for model in (Reference, CallSite, QueryFact, Symbol, Module, MetadataObject):
+            self.session.execute(
+                delete(model)
+                .where(model.source_file_id == file_id)
+                .execution_options(synchronize_session="fetch")
+            )
         self.session.flush()
 
     def _store_bsl(self, project: Project, source_file: SourceFile, text: str) -> None:
@@ -457,121 +547,145 @@ class AnalyzerCore:
         )
         self.session.add(module)
         self.session.flush()
-        symbol_ids: dict[int, int] = {}
+        symbol_rows = [
+            dict(
+                project_id=project.id,
+                module_id=module.id,
+                source_file_id=source_file.id,
+                name=item.name,
+                normalized_name=normalize(item.name),
+                kind=item.kind,
+                is_export=item.is_export,
+                directive=item.directive,
+                region=item.region,
+                line_start=item.line_start,
+                line_end=item.line_end,
+                signature=item.signature,
+                parameters_json=item.parameters_json(),
+                body_hash=item.body_hash,
+            )
+            for item in parsed.symbols
+        ]
+        # Explicit ordered RETURNING keeps caller ordinals correct even for declarations
+        # on the same line. Never assume SQLite's unordered RETURNING follows input order.
+        ids = (
+            list(
+                self.session.scalars(
+                    insert(Symbol).returning(Symbol.id, sort_by_parameter_order=True), symbol_rows
+                )
+            )
+            if symbol_rows
+            else []
+        )
+        symbol_ids = {
+            item.ordinal: identifier for item, identifier in zip(parsed.symbols, ids, strict=True)
+        }
 
         def symbol_id_for(ordinal: int | None) -> int | None:
             return symbol_ids.get(ordinal) if ordinal is not None else None
 
-        for parsed_symbol in parsed.symbols:
-            symbol = Symbol(
-                project_id=project.id,
-                module_id=module.id,
-                source_file_id=source_file.id,
-                name=parsed_symbol.name,
-                normalized_name=normalize(parsed_symbol.name),
-                kind=parsed_symbol.kind,
-                is_export=parsed_symbol.is_export,
-                directive=parsed_symbol.directive,
-                region=parsed_symbol.region,
-                line_start=parsed_symbol.line_start,
-                line_end=parsed_symbol.line_end,
-                signature=parsed_symbol.signature,
-                parameters_json=parsed_symbol.parameters_json(),
-                body_hash=parsed_symbol.body_hash,
-            )
-            self.session.add(symbol)
-            self.session.flush()
-            symbol_ids[parsed_symbol.ordinal] = symbol.id
-        for parsed_call in parsed.calls:
-            self.session.add(
-                CallSite(
+        self._insert_rows(
+            CallSite,
+            (
+                dict(
                     project_id=project.id,
                     source_file_id=source_file.id,
-                    caller_symbol_id=symbol_id_for(parsed_call.caller_ordinal),
-                    callee_name=parsed_call.name,
-                    normalized_name=normalize(parsed_call.name),
-                    qualifier=parsed_call.qualifier,
-                    full_name=parsed_call.full_name,
-                    line=parsed_call.line,
-                    column=parsed_call.column,
+                    caller_symbol_id=symbol_id_for(item.caller_ordinal),
+                    callee_name=item.name,
+                    normalized_name=normalize(item.name),
+                    qualifier=item.qualifier,
+                    full_name=item.full_name,
+                    line=item.line,
+                    column=item.column,
                     resolution="unresolved",
                 )
-            )
-        for parsed_query in parsed.queries:
-            self.session.add(
-                QueryFact(
+                for item in parsed.calls
+            ),
+        )
+        self._insert_rows(
+            QueryFact,
+            (
+                dict(
                     project_id=project.id,
                     source_file_id=source_file.id,
-                    symbol_id=symbol_id_for(parsed_query.caller_ordinal),
-                    line_start=parsed_query.line_start,
-                    line_end=parsed_query.line_end,
-                    kind=parsed_query.kind,
-                    text=parsed_query.text,
-                    text_hash=sha256(parsed_query.text.encode("utf-8")).hexdigest(),
+                    symbol_id=symbol_id_for(item.caller_ordinal),
+                    line_start=item.line_start,
+                    line_end=item.line_end,
+                    kind=item.kind,
+                    text=item.text,
+                    text_hash=sha256(item.text.encode("utf-8")).hexdigest(),
                     tables_json=json.dumps(
                         [
-                            {
-                                "name": table.name,
-                                "normalized": table.normalized,
-                                "operation": table.operation,
-                            }
-                            for table in parsed_query.tables
+                            dict(
+                                name=table.name,
+                                normalized=table.normalized,
+                                operation=table.operation,
+                            )
+                            for table in item.tables
                         ],
                         ensure_ascii=False,
                     ),
                 )
-            )
-        for parsed_reference in parsed.references:
-            self.session.add(
-                Reference(
+                for item in parsed.queries
+            ),
+        )
+        self._insert_rows(
+            Reference,
+            (
+                dict(
                     project_id=project.id,
                     source_file_id=source_file.id,
-                    symbol_id=symbol_id_for(parsed_reference.caller_ordinal),
-                    target_kind=parsed_reference.target_kind,
-                    target_name=parsed_reference.target_name,
-                    target_full_name=parsed_reference.target_full_name,
-                    normalized_target=normalize(parsed_reference.target_full_name),
-                    relation=parsed_reference.relation,
-                    line=parsed_reference.line,
-                    raw_value=parsed_reference.raw_value,
+                    symbol_id=symbol_id_for(item.caller_ordinal),
+                    target_kind=item.target_kind,
+                    target_name=item.target_name,
+                    target_full_name=item.target_full_name,
+                    normalized_target=normalize(item.target_full_name),
+                    relation=item.relation,
+                    line=item.line,
+                    raw_value=item.raw_value,
                 )
-            )
-        self.session.flush()
+                for item in parsed.references
+            ),
+        )
 
     def _store_metadata(
         self, project: Project, source_file: SourceFile, text: str
     ) -> dict[str, str]:
         parsed = self.metadata.parse(text, source_file.relative_path)
-        for metadata_item in parsed.objects:
-            self.session.add(
-                MetadataObject(
+        self._insert_rows(
+            MetadataObject,
+            (
+                dict(
                     project_id=project.id,
                     source_file_id=source_file.id,
-                    uuid=metadata_item.uuid,
-                    kind=metadata_item.kind,
-                    name=metadata_item.name,
-                    full_name=metadata_item.full_name,
-                    parent_full_name=metadata_item.parent_full_name,
-                    synonym=metadata_item.synonym,
-                    properties_json=metadata_item.properties_json,
+                    uuid=item.uuid,
+                    kind=item.kind,
+                    name=item.name,
+                    full_name=item.full_name,
+                    parent_full_name=item.parent_full_name,
+                    synonym=item.synonym,
+                    properties_json=item.properties_json,
                 )
-            )
-        self.session.flush()
-        for metadata_reference in parsed.references:
-            self.session.add(
-                Reference(
+                for item in parsed.objects
+            ),
+        )
+        self._insert_rows(
+            Reference,
+            (
+                dict(
                     project_id=project.id,
                     source_file_id=source_file.id,
-                    source_metadata_name=metadata_reference.source_full_name,
-                    target_kind=metadata_reference.target_kind,
-                    target_name=metadata_reference.target_name,
-                    target_full_name=metadata_reference.target_full_name,
-                    normalized_target=normalize(metadata_reference.target_full_name),
+                    source_metadata_name=item.source_full_name,
+                    target_kind=item.target_kind,
+                    target_name=item.target_name,
+                    target_full_name=item.target_full_name,
+                    normalized_target=normalize(item.target_full_name),
                     relation="metadata_type_reference",
-                    raw_value=metadata_reference.raw_value,
+                    raw_value=item.raw_value,
                 )
-            )
-        self.session.flush()
+                for item in parsed.references
+            ),
+        )
         return parsed.profile
 
     def _resolve(
@@ -579,6 +693,8 @@ class AnalyzerCore:
         project: Project,
         included_projects: tuple[Project, ...] = (),
     ) -> None:
+        self._edges.clear()
+        self._emit("resolve", 0, 0, "Loading metadata and symbol indexes")
         self.session.execute(delete(Dependency).where(Dependency.project_id == project.id))
         self.session.execute(
             delete(CallSite).where(
@@ -595,9 +711,7 @@ class AnalyzerCore:
         primary_modules = list(
             self.session.scalars(select(Module).where(Module.project_id == project.id))
         )
-        primary_symbols = list(
-            self.session.scalars(select(Symbol).where(Symbol.project_id == project.id))
-        )
+        primary_symbols = self._symbols((project.id,))
         included_ids = tuple(item.id for item in included_projects)
         included_metadata = (
             list(
@@ -613,15 +727,34 @@ class AnalyzerCore:
             if included_ids
             else []
         )
-        included_symbols = (
-            list(self.session.scalars(select(Symbol).where(Symbol.project_id.in_(included_ids))))
-            if included_ids
-            else []
-        )
+        included_symbols = self._symbols(included_ids) if included_ids else []
 
         all_metadata = [*primary_metadata, *included_metadata]
         all_modules = [*primary_modules, *included_modules]
         aliases = self._metadata_aliases(all_metadata)
+
+        @lru_cache(maxsize=65_536)
+        def resolve_metadata(raw: str) -> MetadataObject | None:
+            return self._resolve_metadata(raw, aliases)
+
+        registers: dict[str, list[MetadataObject]] = {}
+        for item in all_metadata:
+            if item.kind in {
+                "accounting_register",
+                "accumulation_register",
+                "calculation_register",
+                "information_register",
+            }:
+                registers.setdefault(normalize(item.name), []).append(item)
+
+        @lru_cache(maxsize=4096)
+        def resolve_register(raw: str) -> MetadataObject | None:
+            candidates = registers.get(normalize(raw), [])
+            primary = [item for item in candidates if item.project_id == project.id]
+            if len(primary) == 1:
+                return primary[0]
+            return candidates[0] if len(candidates) == 1 else None
+
         metadata_by_kind_name: dict[tuple[str, str], MetadataObject] = {}
         for item in all_metadata:
             metadata_by_kind_name.setdefault((item.kind, normalize(item.name)), item)
@@ -656,11 +789,11 @@ class AnalyzerCore:
                     True,
                 )
 
-        local_symbols: dict[tuple[int, str], list[Symbol]] = {}
-        primary_exported: dict[str, list[Symbol]] = {}
-        included_exported: dict[str, list[Symbol]] = {}
-        primary_qualified: dict[tuple[str, str], list[Symbol]] = {}
-        included_qualified: dict[tuple[str, str], list[Symbol]] = {}
+        local_symbols: dict[tuple[int, str], list[_Symbol]] = {}
+        primary_exported: dict[str, list[_Symbol]] = {}
+        included_exported: dict[str, list[_Symbol]] = {}
+        primary_qualified: dict[tuple[str, str], list[_Symbol]] = {}
+        included_qualified: dict[tuple[str, str], list[_Symbol]] = {}
 
         for symbol in primary_symbols:
             local_symbols.setdefault((symbol.module_id, symbol.normalized_name), []).append(symbol)
@@ -684,8 +817,8 @@ class AnalyzerCore:
                         (normalize(qualifier), symbol.normalized_name), []
                     ).append(symbol)
 
-        document_managers: dict[tuple[str, str], list[Symbol]] = {}
-        included_document_managers: dict[tuple[str, str], list[Symbol]] = {}
+        document_managers: dict[tuple[str, str], list[_Symbol]] = {}
+        included_document_managers: dict[tuple[str, str], list[_Symbol]] = {}
         for pool, index in (
             (primary_symbols, document_managers),
             (included_symbols, included_document_managers),
@@ -701,204 +834,243 @@ class AnalyzerCore:
                     index.setdefault(key, []).append(symbol)
 
         symbols_by_id = {item.id: item for item in primary_symbols}
-        calls = list(
-            self.session.scalars(select(CallSite).where(CallSite.project_id == project.id))
-        )
-        for call in calls:
-            call.resolved_symbol_id = None
-            call.resolution = "unresolved_unqualified"
-            caller = symbols_by_id.get(call.caller_symbol_id) if call.caller_symbol_id else None
-            candidates: list[Symbol] = []
-            qualifier_root = normalize(call.qualifier.split(".")[0]) if call.qualifier else ""
-            qualifier_parts = call.qualifier.split(".") if call.qualifier else []
-            if len(qualifier_parts) == 2 and qualifier_root in {
-                normalize("Документы"),
-                normalize("Documents"),
-            }:
-                # Only exported members of this document's manager are callable here.
-                # Never fall back to a same-named object/form/common-module method.
-                document_name = normalize(qualifier_parts[1])
-                for manager_index, resolution in (
-                    (document_managers, "document_manager"),
-                    (included_document_managers, "included_document_manager"),
-                ):
-                    candidates = manager_index.get((document_name, call.normalized_name), [])
-                    if candidates:
-                        call.resolution = (
-                            resolution if len(candidates) == 1 else "ambiguous_document_manager"
+        self.session.flush()
+        self._flush_edges()
+        call_total = self._call_count(project.id)
+        completed = 0
+        self._emit("calls", 0, call_total)
+        for batch in self._batches(CallSite, project.id):
+            updates: list[dict[str, Any]] = []
+            for call in batch:
+                resolved_symbol_id: int | None = None
+                resolution = "unresolved_unqualified"
+                caller = symbols_by_id.get(call.caller_symbol_id) if call.caller_symbol_id else None
+                candidates: list[_Symbol] = []
+                qualifier_root = normalize(call.qualifier.split(".")[0]) if call.qualifier else ""
+                qualifier_parts = call.qualifier.split(".") if call.qualifier else []
+                if len(qualifier_parts) == 2 and qualifier_root in {
+                    normalize("Документы"),
+                    normalize("Documents"),
+                }:
+                    # Only exported members of this document's manager are callable here.
+                    # Never fall back to a same-named object/form/common-module method.
+                    document_name = normalize(qualifier_parts[1])
+                    for manager_index, resolution in (
+                        (document_managers, "document_manager"),
+                        (included_document_managers, "included_document_manager"),
+                    ):
+                        candidates = manager_index.get((document_name, call.normalized_name), [])
+                        if candidates:
+                            resolution = (
+                                resolution if len(candidates) == 1 else "ambiguous_document_manager"
+                            )
+                            break
+                    if not candidates:
+                        resolution = "platform_api"
+                elif call.qualifier:
+                    if caller and qualifier_root in {
+                        normalize("ЭтотОбъект"),
+                        normalize("ThisObject"),
+                    }:
+                        candidates = local_symbols.get((caller.module_id, call.normalized_name), [])
+                        if len(candidates) == 1:
+                            resolution = "same_module_object"
+                    if not candidates:
+                        candidates = primary_qualified.get(
+                            (qualifier_root, call.normalized_name), []
                         )
-                        break
-                if not candidates:
-                    call.resolution = "platform_api"
-            elif call.qualifier:
-                if caller and qualifier_root in {normalize("ЭтотОбъект"), normalize("ThisObject")}:
+                        if len(candidates) == 1:
+                            resolution = "qualified_module"
+                    if not candidates:
+                        candidates = included_qualified.get(
+                            (qualifier_root, call.normalized_name), []
+                        )
+                        if len(candidates) == 1:
+                            resolution = "included_qualified_module"
+                        elif len(candidates) > 1:
+                            resolution = "ambiguous_included_qualified"
+                    elif len(candidates) > 1:
+                        resolution = "ambiguous_qualified"
+                    if not candidates:
+                        if (
+                            qualifier_root in _PLATFORM_QUALIFIERS
+                            or qualifier_root in _MANAGER_QUALIFIERS
+                        ):
+                            resolution = "platform_api"
+                        elif qualifier_root in module_qualifiers:
+                            resolution = "unresolved_qualified"
+                        else:
+                            resolution = "dynamic_qualified"
+                elif caller:
                     candidates = local_symbols.get((caller.module_id, call.normalized_name), [])
                     if len(candidates) == 1:
-                        call.resolution = "same_module_object"
-                if not candidates:
-                    candidates = primary_qualified.get((qualifier_root, call.normalized_name), [])
-                    if len(candidates) == 1:
-                        call.resolution = "qualified_module"
-                if not candidates:
-                    candidates = included_qualified.get((qualifier_root, call.normalized_name), [])
-                    if len(candidates) == 1:
-                        call.resolution = "included_qualified_module"
+                        resolution = "same_module"
                     elif len(candidates) > 1:
-                        call.resolution = "ambiguous_included_qualified"
-                elif len(candidates) > 1:
-                    call.resolution = "ambiguous_qualified"
-                if not candidates:
-                    if (
-                        qualifier_root in _PLATFORM_QUALIFIERS
-                        or qualifier_root in _MANAGER_QUALIFIERS
-                    ):
-                        call.resolution = "platform_api"
-                    elif qualifier_root in module_qualifiers:
-                        call.resolution = "unresolved_qualified"
+                        resolution = "ambiguous_local"
                     else:
-                        call.resolution = "dynamic_qualified"
-            elif caller:
-                candidates = local_symbols.get((caller.module_id, call.normalized_name), [])
-                if len(candidates) == 1:
-                    call.resolution = "same_module"
-                elif len(candidates) > 1:
-                    call.resolution = "ambiguous_local"
-                else:
-                    common_candidates = [
-                        item
-                        for item in primary_exported.get(call.normalized_name, [])
-                        if modules_by_id[item.module_id].owner_kind == "common_module"
-                    ]
-                    if len(common_candidates) == 1:
-                        candidates = common_candidates
-                        call.resolution = "global_common_module"
-                    else:
-                        candidates = primary_exported.get(call.normalized_name, [])
-                        if len(candidates) == 1:
-                            call.resolution = "unique_export"
-                        elif len(candidates) > 1:
-                            call.resolution = "ambiguous_export"
-                    if not candidates:
-                        included_common = [
+                        common_candidates = [
                             item
-                            for item in included_exported.get(call.normalized_name, [])
+                            for item in primary_exported.get(call.normalized_name, [])
                             if modules_by_id[item.module_id].owner_kind == "common_module"
                         ]
-                        if len(included_common) == 1:
-                            candidates = included_common
-                            call.resolution = "included_global_common_module"
-                        elif len(included_common) > 1:
-                            candidates = included_common
-                            call.resolution = "ambiguous_included_common_module"
+                        if len(common_candidates) == 1:
+                            candidates = common_candidates
+                            resolution = "global_common_module"
                         else:
-                            candidates = included_exported.get(call.normalized_name, [])
+                            candidates = primary_exported.get(call.normalized_name, [])
                             if len(candidates) == 1:
-                                call.resolution = "included_unique_export"
+                                resolution = "unique_export"
                             elif len(candidates) > 1:
-                                call.resolution = "ambiguous_included_export"
-            if len(candidates) == 1:
-                target_symbol = candidates[0]
-                call.resolved_symbol_id = target_symbol.id
-                caller_module = modules_by_file.get(call.source_file_id)
-                source_name = (
-                    self._symbol_name(caller, modules_by_id)
-                    if caller
-                    else caller_module.full_name
-                    if caller_module
-                    else "<module>"
+                                resolution = "ambiguous_export"
+                        if not candidates:
+                            included_common = [
+                                item
+                                for item in included_exported.get(call.normalized_name, [])
+                                if modules_by_id[item.module_id].owner_kind == "common_module"
+                            ]
+                            if len(included_common) == 1:
+                                candidates = included_common
+                                resolution = "included_global_common_module"
+                            elif len(included_common) > 1:
+                                candidates = included_common
+                                resolution = "ambiguous_included_common_module"
+                            else:
+                                candidates = included_exported.get(call.normalized_name, [])
+                                if len(candidates) == 1:
+                                    resolution = "included_unique_export"
+                                elif len(candidates) > 1:
+                                    resolution = "ambiguous_included_export"
+                if len(candidates) == 1:
+                    target_symbol = candidates[0]
+                    resolved_symbol_id = target_symbol.id
+                    caller_module = modules_by_file.get(call.source_file_id)
+                    source_name = (
+                        self._symbol_name(caller, modules_by_id)
+                        if caller
+                        else caller_module.full_name
+                        if caller_module
+                        else "<module>"
+                    )
+                    self._edge(
+                        project.id,
+                        call.source_file_id,
+                        "symbol" if caller else "module",
+                        caller.id if caller else None,
+                        source_name,
+                        "symbol",
+                        target_symbol.id,
+                        self._symbol_name(target_symbol, modules_by_id),
+                        "calls",
+                        call.line,
+                        True,
+                        {"target_project": target_symbol.project_id}
+                        if target_symbol.project_id != project.id
+                        else None,
+                    )
+                elif not call.qualifier and call.normalized_name in _BUILTINS:
+                    resolution = "built_in"
+                elif not call.qualifier and call.normalized_name in _PLATFORM_GLOBALS:
+                    resolution = "platform_api"
+                updates.append(
+                    dict(_key=call.id, resolved_symbol_id=resolved_symbol_id, resolution=resolution)
                 )
+            self._update_rows(CallSite, updates)
+            self._flush_edges()
+            completed += len(batch)
+            self._emit("calls", completed, call_total)
+
+        reference_total = self._row_count(Reference, project.id)
+        completed = 0
+        self._emit("references", 0, reference_total)
+        for batch in self._batches(Reference, project.id):
+            updates = []
+            for reference in batch:
+                target_metadata = (
+                    resolve_register(reference.target_name)
+                    if reference.target_kind == "register"
+                    else resolve_metadata(reference.target_full_name)
+                )
+                updates.append(
+                    dict(
+                        _key=reference.id,
+                        metadata_object_id=target_metadata.id if target_metadata else None,
+                    )
+                )
+                source_symbol = (
+                    symbols_by_id.get(reference.symbol_id) if reference.symbol_id else None
+                )
+                source_module = modules_by_file.get(reference.source_file_id)
+                source_name = reference.source_metadata_name or (
+                    self._symbol_name(source_symbol, modules_by_id)
+                    if source_symbol
+                    else source_module.full_name
+                    if source_module
+                    else "<source>"
+                )
+                details: dict[str, object] = (
+                    {"raw": reference.raw_value} if reference.raw_value else {}
+                )
+                if target_metadata and target_metadata.project_id != project.id:
+                    details["target_project"] = target_metadata.project_id
                 self._edge(
                     project.id,
-                    call.source_file_id,
-                    "symbol" if caller else "module",
-                    caller.id if caller else None,
-                    source_name,
-                    "symbol",
-                    target_symbol.id,
-                    self._symbol_name(target_symbol, modules_by_id),
-                    "calls",
-                    call.line,
-                    True,
-                    {"target_project": target_symbol.project_id}
-                    if target_symbol.project_id != project.id
-                    else None,
-                )
-            elif not call.qualifier and call.normalized_name in _BUILTINS:
-                call.resolution = "built_in"
-            elif not call.qualifier and call.normalized_name in _PLATFORM_GLOBALS:
-                call.resolution = "platform_api"
-
-        for reference in self.session.scalars(
-            select(Reference).where(Reference.project_id == project.id)
-        ):
-            target_metadata = (
-                self._resolve_register(reference.target_name, all_metadata, project.id)
-                if reference.target_kind == "register"
-                else self._resolve_metadata(reference.target_full_name, aliases)
-            )
-            reference.metadata_object_id = target_metadata.id if target_metadata else None
-            source_symbol = symbols_by_id.get(reference.symbol_id) if reference.symbol_id else None
-            source_module = modules_by_file.get(reference.source_file_id)
-            source_name = reference.source_metadata_name or (
-                self._symbol_name(source_symbol, modules_by_id)
-                if source_symbol
-                else source_module.full_name
-                if source_module
-                else "<source>"
-            )
-            details: dict[str, object] = {"raw": reference.raw_value} if reference.raw_value else {}
-            if target_metadata and target_metadata.project_id != project.id:
-                details["target_project"] = target_metadata.project_id
-            self._edge(
-                project.id,
-                reference.source_file_id,
-                "metadata"
-                if reference.source_metadata_name
-                else "symbol"
-                if source_symbol
-                else "module",
-                source_symbol.id if source_symbol else None,
-                source_name,
-                "metadata",
-                target_metadata.id if target_metadata else None,
-                target_metadata.full_name if target_metadata else reference.target_full_name,
-                reference.relation,
-                reference.line,
-                target_metadata is not None,
-                details or None,
-            )
-
-        for query in self.session.scalars(
-            select(QueryFact).where(QueryFact.project_id == project.id)
-        ):
-            source_symbol = symbols_by_id.get(query.symbol_id) if query.symbol_id else None
-            source_name = (
-                self._symbol_name(source_symbol, modules_by_id)
-                if source_symbol
-                else f"query:{query.id}"
-            )
-            for table in json.loads(query.tables_json):
-                target_metadata = self._resolve_metadata(str(table["name"]), aliases)
-                self._edge(
-                    project.id,
-                    query.source_file_id,
-                    "symbol" if source_symbol else "query",
-                    source_symbol.id if source_symbol else query.id,
+                    reference.source_file_id,
+                    "metadata"
+                    if reference.source_metadata_name
+                    else "symbol"
+                    if source_symbol
+                    else "module",
+                    source_symbol.id if source_symbol else None,
                     source_name,
                     "metadata",
                     target_metadata.id if target_metadata else None,
-                    target_metadata.full_name if target_metadata else str(table["name"]),
-                    f"query_{table['operation']}",
-                    query.line_start,
+                    target_metadata.full_name if target_metadata else reference.target_full_name,
+                    reference.relation,
+                    reference.line,
                     target_metadata is not None,
-                    {"target_project": target_metadata.project_id}
-                    if target_metadata and target_metadata.project_id != project.id
-                    else None,
+                    details or None,
                 )
+            self._update_rows(Reference, updates)
+            self._flush_edges()
+            completed += len(batch)
+            self._emit("references", completed, reference_total)
+
+        query_total = self._row_count(QueryFact, project.id)
+        completed = 0
+        self._emit("queries", 0, query_total)
+        for batch in self._batches(QueryFact, project.id):
+            for query in batch:
+                source_symbol = symbols_by_id.get(query.symbol_id) if query.symbol_id else None
+                source_name = (
+                    self._symbol_name(source_symbol, modules_by_id)
+                    if source_symbol
+                    else f"query:{query.id}"
+                )
+                for table in json.loads(query.tables_json):
+                    target_metadata = resolve_metadata(str(table["name"]))
+                    self._edge(
+                        project.id,
+                        query.source_file_id,
+                        "symbol" if source_symbol else "query",
+                        source_symbol.id if source_symbol else query.id,
+                        source_name,
+                        "metadata",
+                        target_metadata.id if target_metadata else None,
+                        target_metadata.full_name if target_metadata else str(table["name"]),
+                        f"query_{table['operation']}",
+                        query.line_start,
+                        target_metadata is not None,
+                        {"target_project": target_metadata.project_id}
+                        if target_metadata and target_metadata.project_id != project.id
+                        else None,
+                    )
+            self._flush_edges()
+            completed += len(batch)
+            self._emit("queries", completed, query_total)
 
         for item in primary_metadata:
             if item.parent_full_name:
-                parent = self._resolve_metadata(item.parent_full_name, aliases)
+                parent = resolve_metadata(item.parent_full_name)
                 if parent:
                     self._edge(
                         project.id,
@@ -916,7 +1088,11 @@ class AnalyzerCore:
                         if parent.project_id != project.id
                         else None,
                     )
+        self._flush_edges()
         self.session.flush()
+        # Core bulk updates bypass ORM state; callers reusing this Session must not
+        # observe cached pre-resolution call/reference objects.
+        self.session.expire_all()
 
     @staticmethod
     def _metadata_aliases(items: list[MetadataObject]) -> dict[str, MetadataObject]:
@@ -931,34 +1107,12 @@ class AnalyzerCore:
         value = normalize(raw)
         if value in aliases:
             return aliases[value]
-        matches = [
-            (key, item) for key, item in aliases.items() if len(key) > 4 and value.startswith(key)
-        ]
-        return max(matches, key=lambda pair: len(pair[0]))[1] if matches else None
-
-    @staticmethod
-    def _resolve_register(
-        raw_name: str,
-        items: list[MetadataObject],
-        primary_project_id: int,
-    ) -> MetadataObject | None:
-        needle = normalize(raw_name)
-        candidates = [
-            item
-            for item in items
-            if item.kind
-            in {
-                "accounting_register",
-                "accumulation_register",
-                "calculation_register",
-                "information_register",
-            }
-            and normalize(item.name) == needle
-        ]
-        primary = [item for item in candidates if item.project_id == primary_project_id]
-        if len(primary) == 1:
-            return primary[0]
-        return candidates[0] if len(candidates) == 1 else None
+        # Preserve longest-prefix matching without scanning configuration metadata.
+        # Short aliases remain valid only as exact matches.
+        for length in range(len(value) - 1, 4, -1):
+            if match := aliases.get(value[:length]):
+                return match
+        return None
 
     def _edge(
         self,
@@ -975,8 +1129,8 @@ class AnalyzerCore:
         resolved: bool,
         details: dict[str, object] | None = None,
     ) -> None:
-        self.session.add(
-            Dependency(
+        self._edges.append(
+            dict(
                 project_id=project_id,
                 source_file_id=source_file_id,
                 source_kind=source_kind,
@@ -991,9 +1145,17 @@ class AnalyzerCore:
                 details_json=json.dumps(details, ensure_ascii=False) if details else None,
             )
         )
+        if len(self._edges) >= _BATCH_SIZE:
+            self._flush_edges()
+
+    def _row_count(self, model: type[Any], project_id: int) -> int:
+        return int(
+            self.session.scalar(select(func.count(model.id)).where(model.project_id == project_id))
+            or 0
+        )
 
     @staticmethod
-    def _symbol_name(symbol: Symbol, modules: dict[int, Module]) -> str:
+    def _symbol_name(symbol: _Symbol, modules: dict[int, Module]) -> str:
         return f"{modules[symbol.module_id].full_name}.{symbol.name}"
 
     @staticmethod

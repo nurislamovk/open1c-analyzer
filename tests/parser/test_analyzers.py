@@ -5,6 +5,19 @@ import pytest
 from open1c_analyzer.parser import BslAnalyzer, MetadataParser
 
 
+def test_call_ownership_preserves_gaps_and_same_line_declarations() -> None:
+    parsed = BslAnalyzer().parse(
+        'Сообщить("module");\n'
+        'Процедура Первая()\nСообщить("first");\nКонецПроцедуры\n'
+        'Сообщить("gap");\n'
+        'Процедура Вторая() Сообщить("second"); КонецПроцедуры '
+        'Процедура Третья() Сообщить("third"); КонецПроцедуры\n'
+        'Сообщить("after");'
+    )
+    assert [item.name for item in parsed.symbols] == ["Первая", "Вторая", "Третья"]
+    assert [call.caller_ordinal for call in parsed.calls] == [None, 0, None, 1, 1, None]
+
+
 def test_bsl_analyzer_extracts_core_facts() -> None:
     text = """#Область ПубличныйИнтерфейс
 &НаСервере

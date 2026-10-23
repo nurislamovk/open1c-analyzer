@@ -4,7 +4,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Connection, Engine, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 
@@ -37,9 +37,18 @@ class Database:
 
         @event.listens_for(self.engine, "connect")
         def set_sqlite_pragma(dbapi_connection: object, _: object) -> None:
+            # Let SQLAlchemy issue BEGIN even for SELECT/savepoints. sqlite3's
+            # legacy transaction mode can otherwise commit a standalone SAVEPOINT.
+            dbapi_connection.isolation_level = None  # type: ignore[attr-defined]
             cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
+            cursor.execute("PRAGMA busy_timeout=5000")
+            cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.close()
+
+        @event.listens_for(self.engine, "begin")
+        def begin_sqlite_transaction(connection: Connection) -> None:
+            connection.exec_driver_sql("BEGIN")
 
     @contextmanager
     def session(self) -> Iterator[Session]:

@@ -63,6 +63,19 @@ can be indexed and linked in one command:
 uv run open1c project analyze TMS_EXT --include TMS_UNF
 ```
 
+Analysis and resolution print throttled progress for scanning, file analysis,
+calls, metadata references and queries. Use `--quiet` to retain only the final
+summary. Facts and graph edges are written in bounded batches; call and reference
+resolution no longer loads the entire project into ORM change tracking.
+
+File-backed SQLite databases use WAL. Readers see the previous committed index
+while analysis builds its replacement, and files and graph are committed together.
+Interrupting an analysis rolls back that transaction; individual file errors remain
+isolated and are reported in the summary. SQLite still permits only one writer at
+a time. Long-lived reader transactions retain their original snapshot and can delay
+WAL checkpoints. Use SQLite's backup API, or close all connections before copying a
+database file, so that committed data in a live `-wal` sidecar is included.
+
 ## Collected knowledge
 
 The analyzer stores:
